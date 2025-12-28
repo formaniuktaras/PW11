@@ -2161,6 +2161,24 @@ def list_channel_codes_for_product(product_id: int) -> list[sqlite3.Row]:
         return list(conn.execute(query, (product_id,)))
 
 
+def list_all_channel_codes() -> list[sqlite3.Row]:
+    query = """
+        SELECT pcc.id,
+               sc.name AS channel_name,
+               pcc.external_sku,
+               p.sku AS internal_sku,
+               pcc.is_active,
+               pcc.note,
+               pcc.last_seen_at
+        FROM ProductChannelCodes pcc
+        JOIN SalesChannels sc ON sc.id = pcc.channel_id
+        JOIN Products p ON p.id = pcc.product_id
+        ORDER BY sc.name, pcc.external_sku
+    """
+    with get_connection() as conn:
+        return list(conn.execute(query))
+
+
 def upsert_channel_code(
     channel_id: int,
     product_id: int,

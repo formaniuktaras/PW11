@@ -354,7 +354,7 @@ class ProductsTab:
     def open_product_channel_codes(self) -> None:
         product_id = self.product_table.selected_id()
         if not product_id:
-            show_error("Оберіть товар")
+            show_error("Коди каналів", "Оберіть товар.")
             return
         product = db.get_product(int(product_id))
         if not product:
