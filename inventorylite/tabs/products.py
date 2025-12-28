@@ -106,6 +106,7 @@ class ProductsTab:
             command=lambda: open_products_bulk_actions_dialog(self, db.get_connection(), self.product_table),
         ).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Рух", command=self.open_product_stock_moves).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Комплектація", command=self.open_product_assemblies).pack(side=tk.LEFT, padx=4)
 
     def set_category_filter_options(self, options: list[dict]) -> None:
         self.category_filter_options = list(options or [])
@@ -336,6 +337,17 @@ class ProductsTab:
             show_error("Рух товару", "Оберіть товар.")
             return
         open_stock_moves_dialog(self.frame.winfo_toplevel(), self.settings, int(product_id), None)
+
+    def open_product_assemblies(self) -> None:
+        product_id = self.product_table.selected_id()
+        if not product_id:
+            show_error("Комплектація", "Оберіть товар.")
+            return
+        product = db.get_product(int(product_id))
+        if not product:
+            show_error("Комплектація", "Товар не знайдено.")
+            return
+        ProductAssemblyConfigDialog(self.frame, product)
 
     def _process_product_import(self, rows: list[dict], options: dict) -> str:
         mode = options.get("mode", "create")
@@ -644,6 +656,152 @@ class ProductsTab:
         categories_by_id[int(cat_id)] = cat_row
         categories_by_name[clean.lower()] = cat_row
         return int(cat_id)
+
+
+class ProductAssemblyConfigDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, product: dict) -> None:
+        super().__init__(parent)
+        self.title(f"Комплектація товару: {product.get('sku')} — {product.get('name')}")
+        self.resizable(True, True)
+        self.transient(parent.winfo_toplevel())
+        self.grab_set()
+        self.product_id = int(product["id"])
+        self.groups: list[dict] = []
+        self.slots: list[dict] = []
+
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        info = ttk.Label(
+            main,
+            text=(
+                "Членство в групі означає взаємозамінність. Покриття слотів означає, що товар може "
+                "закривати один або кілька слотів (напр. набір 4в1 може покривати INSTALL_KIT та SCRAPER)."
+            ),
+            wraplength=640,
+            justify="left",
+        )
+        info.pack(fill=tk.X, pady=(0, 8))
+
+        tables = ttk.Frame(main)
+        tables.pack(fill=tk.BOTH, expand=True)
+
+        group_frame = ttk.LabelFrame(tables, text="Групи (взаємозамінність)")
+        group_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+        group_columns = [
+            ("code", "Код", 140),
+            ("name", "Назва", 220),
+            ("is_member", "У групі", 90),
+            ("priority", "Пріоритет", 90),
+        ]
+        self.group_table = TableFrame(group_frame, group_columns, height=12)
+        self.group_table.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.group_table.on_double_click(self._toggle_group_membership)
+
+        slot_frame = ttk.LabelFrame(tables, text="Слоти, які покриває товар")
+        slot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+        slot_columns = [
+            ("code", "Код", 160),
+            ("name", "Назва", 220),
+            ("is_covered", "Покриває", 90),
+        ]
+        self.slot_table = TableFrame(slot_frame, slot_columns, height=12)
+        self.slot_table.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.slot_table.on_double_click(self._toggle_slot_coverage)
+
+        btns = ttk.Frame(main)
+        btns.pack(fill=tk.X, pady=6)
+        ttk.Button(btns, text="Оновити", command=self.refresh_data).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Закрити", command=self.destroy).pack(side=tk.RIGHT, padx=4)
+
+        self.refresh_data()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.wait_window(self)
+
+    def refresh_data(self) -> None:
+        try:
+            self.groups = db.list_all_groups_with_product_flag(self.product_id)
+            self.slots = db.list_all_slots_with_product_flag(self.product_id)
+        except Exception:
+            logging.exception("Failed to load assemblies data for product")
+            show_error("Комплектація", "Не вдалося завантажити дані комплектування.")
+            return
+
+        self.group_table.set_rows(
+            [
+                {
+                    "id": g["id"],
+                    "code": g.get("code"),
+                    "name": g.get("name"),
+                    "is_member": "Так" if g.get("is_member") else "Ні",
+                    "priority": g.get("priority") if g.get("is_member") else "",
+                }
+                for g in self.groups
+            ]
+        )
+        self.slot_table.set_rows(
+            [
+                {
+                    "id": s["id"],
+                    "code": s.get("code"),
+                    "name": s.get("name"),
+                    "is_covered": "Так" if s.get("is_covered") else "Ні",
+                }
+                for s in self.slots
+            ]
+        )
+
+    def _toggle_group_membership(self) -> None:
+        selection = self.group_table.selected_id()
+        if selection is None:
+            show_error("Комплектація", "Оберіть групу для зміни.")
+            return
+        group = next((g for g in self.groups if int(g["id"]) == int(selection)), None)
+        if not group:
+            return
+        try:
+            if group.get("is_member"):
+                db.set_product_in_component_group(self.product_id, int(group["id"]), False)
+            else:
+                default_priority = group.get("priority") or 100
+                values = simple_prompt(
+                    "Пріоритет (менше = краще)",
+                    ["Пріоритет"],
+                    [str(default_priority)],
+                )
+                if not values:
+                    return
+                try:
+                    priority = int(values[0])
+                except (TypeError, ValueError):
+                    show_error("Комплектація", "Пріоритет має бути цілим числом.")
+                    return
+                db.set_product_in_component_group(self.product_id, int(group["id"]), True, priority)
+        except sqlite3.IntegrityError:
+            show_error("Комплектація", "Не вдалося оновити групу. Перевірте унікальність коду.")
+        except Exception:
+            logging.exception("Failed to toggle group membership")
+            show_error("Комплектація", "Не вдалося змінити налаштування групи.")
+        finally:
+            self.refresh_data()
+
+    def _toggle_slot_coverage(self) -> None:
+        selection = self.slot_table.selected_id()
+        if selection is None:
+            show_error("Комплектація", "Оберіть слот для зміни.")
+            return
+        slot = next((s for s in self.slots if int(s["id"]) == int(selection)), None)
+        if not slot:
+            return
+        try:
+            db.set_product_slot_covered(self.product_id, int(slot["id"]), not bool(slot.get("is_covered")))
+        except sqlite3.IntegrityError:
+            show_error("Комплектація", "Не вдалося оновити покриття слоту через конфлікт унікальності.")
+        except Exception:
+            logging.exception("Failed to toggle slot coverage")
+            show_error("Комплектація", "Не вдалося змінити покриття слоту.")
+        finally:
+            self.refresh_data()
 
 
 class ProductsImportDialog(tk.Toplevel):

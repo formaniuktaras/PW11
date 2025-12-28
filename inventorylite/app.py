@@ -40,6 +40,7 @@ from inventorylite.dialogs_labels import open_labels_print_dialog
 from inventorylite.tabs.categories import CategoriesTab
 from inventorylite.tabs.brands import BrandsTab
 from inventorylite.tabs.counterparties import CounterpartiesTab
+from inventorylite.tabs.assemblies import AssembliesTab
 from inventorylite.tabs.products import ProductsTab, open_products_bulk_actions_dialog
 from inventorylite.tabs.reports import ReportsTab
 from inventorylite.tabs.settings import SettingsTab
@@ -111,6 +112,12 @@ class InventoryApp(tk.Tk):
             on_products_refresh=lambda: self.refresh_products(),
         )
         self.notebook.add(self.categories_tab.frame, text="Категорії")
+        self.assemblies_tab = AssembliesTab(
+            parent=self.notebook,
+            settings=self.settings,
+            on_data_changed=lambda: None,
+        )
+        self.notebook.add(self.assemblies_tab.frame, text="Комплектації")
         self.products_tab = ProductsTab(
             parent=self.notebook,
             settings=self.settings,
@@ -1253,6 +1260,10 @@ class InventoryApp(tk.Tk):
         if hasattr(self, "channels_tab"):
             self.channels_tab.refresh_channels()
 
+    def refresh_assemblies(self) -> None:
+        if hasattr(self, "assemblies_tab"):
+            self.assemblies_tab.show()
+
     def _startup_refresh_all_safe(self) -> None:
         logging.info("Startup refresh_all begin")
         self.status_var.set("Завантаження...")
@@ -1264,6 +1275,7 @@ class InventoryApp(tk.Tk):
         steps: list[tuple[str, callable]] = [
             ("brands", self.refresh_brands),
             ("categories", self.refresh_categories),
+            ("assemblies", self.refresh_assemblies),
             ("products", self.refresh_products),
             ("counterparties", self.refresh_counterparties),
             ("warehouses", self.refresh_warehouses),
@@ -1305,6 +1317,7 @@ class InventoryApp(tk.Tk):
     def refresh_all(self) -> None:
         self.refresh_brands()
         self.refresh_categories()
+        self.refresh_assemblies()
         self.refresh_products()
         self.refresh_counterparties()
         self.refresh_warehouses()

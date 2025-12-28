@@ -373,6 +373,43 @@ def init_db() -> None:
                 FOREIGN KEY (category_id) REFERENCES Categories(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS ComponentGroups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                note TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS AssemblySlots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                note TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS ProductComponentGroupMembers (
+                group_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 100,
+                PRIMARY KEY (group_id, product_id),
+                FOREIGN KEY (group_id) REFERENCES ComponentGroups(id) ON DELETE CASCADE,
+                FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS ProductSlotCoverage (
+                product_id INTEGER NOT NULL,
+                slot_id INTEGER NOT NULL,
+                PRIMARY KEY (product_id, slot_id),
+                FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE,
+                FOREIGN KEY (slot_id) REFERENCES AssemblySlots(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_component_groups_code_lower ON ComponentGroups(lower(trim(code)));
+            CREATE INDEX IF NOT EXISTS idx_assembly_slots_code_lower ON AssemblySlots(lower(trim(code)));
+            CREATE INDEX IF NOT EXISTS idx_pcm_product ON ProductComponentGroupMembers(product_id);
+            CREATE INDEX IF NOT EXISTS idx_pcm_group ON ProductComponentGroupMembers(group_id);
+            CREATE INDEX IF NOT EXISTS idx_psc_product ON ProductSlotCoverage(product_id);
+            CREATE INDEX IF NOT EXISTS idx_psc_slot ON ProductSlotCoverage(slot_id);
+
             CREATE INDEX IF NOT EXISTS idx_products_sku_lower ON Products(lower(trim(sku)));
             CREATE INDEX IF NOT EXISTS idx_products_name_lower ON Products(lower(name));
             CREATE INDEX IF NOT EXISTS idx_products_supplier_sku_lower ON Products(lower(trim(supplier_sku)));
@@ -2173,6 +2210,181 @@ def get_product(product_id: int) -> Optional[dict]:
         "is_active": bool(row["is_active"]),
         "extra_categories": extra,
     }
+
+
+# Assemblies / component groups
+
+def list_component_groups() -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT id, code, name, note FROM ComponentGroups ORDER BY code").fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_component_group(code: str, name: str, note: str | None = None) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO ComponentGroups (code, name, note) VALUES (?, ?, ?)",
+            (code.strip(), name.strip(), (note or "").strip() or None),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_component_group(group_id: int, code: str, name: str, note: str | None = None) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE ComponentGroups SET code=?, name=?, note=? WHERE id=?",
+            (code.strip(), name.strip(), (note or "").strip() or None, group_id),
+        )
+        conn.commit()
+
+
+def delete_component_group(group_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM ComponentGroups WHERE id=?", (group_id,))
+        conn.commit()
+
+
+def list_assembly_slots() -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT id, code, name, note FROM AssemblySlots ORDER BY code").fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_assembly_slot(code: str, name: str, note: str | None = None) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO AssemblySlots (code, name, note) VALUES (?, ?, ?)",
+            (code.strip(), name.strip(), (note or "").strip() or None),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_assembly_slot(slot_id: int, code: str, name: str, note: str | None = None) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE AssemblySlots SET code=?, name=?, note=? WHERE id=?",
+            (code.strip(), name.strip(), (note or "").strip() or None, slot_id),
+        )
+        conn.commit()
+
+
+def delete_assembly_slot(slot_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM AssemblySlots WHERE id=?", (slot_id,))
+        conn.commit()
+
+
+def list_product_component_groups(product_id: int) -> list[dict]:
+    query = """
+        SELECT cg.id AS group_id, cg.code, cg.name, m.priority
+        FROM ProductComponentGroupMembers m
+        JOIN ComponentGroups cg ON cg.id = m.group_id
+        WHERE m.product_id = ?
+        ORDER BY m.priority, cg.code
+    """
+    with get_connection() as conn:
+        rows = conn.execute(query, (product_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_product_in_component_group(
+    product_id: int, group_id: int, in_group: bool, priority: int = 100
+) -> None:
+    with get_connection() as conn:
+        if in_group:
+            conn.execute(
+                """
+                INSERT INTO ProductComponentGroupMembers (group_id, product_id, priority)
+                VALUES (?, ?, ?)
+                ON CONFLICT(group_id, product_id) DO UPDATE SET priority=excluded.priority
+                """,
+                (group_id, product_id, int(priority)),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM ProductComponentGroupMembers WHERE group_id=? AND product_id=?",
+                (group_id, product_id),
+            )
+        conn.commit()
+
+
+def get_product_group_priority(product_id: int, group_id: int) -> Optional[int]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT priority FROM ProductComponentGroupMembers WHERE product_id=? AND group_id=?",
+            (product_id, group_id),
+        ).fetchone()
+    return int(row["priority"]) if row else None
+
+
+def list_product_slot_coverage(product_id: int) -> list[dict]:
+    query = """
+        SELECT s.id AS slot_id, s.code, s.name
+        FROM ProductSlotCoverage c
+        JOIN AssemblySlots s ON s.id = c.slot_id
+        WHERE c.product_id = ?
+        ORDER BY s.code
+    """
+    with get_connection() as conn:
+        rows = conn.execute(query, (product_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_product_slot_covered(product_id: int, slot_id: int, covered: bool) -> None:
+    with get_connection() as conn:
+        if covered:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO ProductSlotCoverage (product_id, slot_id) VALUES (?, ?)
+                """,
+                (product_id, slot_id),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM ProductSlotCoverage WHERE product_id=? AND slot_id=?",
+                (product_id, slot_id),
+            )
+        conn.commit()
+
+
+def list_all_groups_with_product_flag(product_id: int) -> list[dict]:
+    groups = list_component_groups()
+    memberships = {
+        int(row["group_id"]): int(row.get("priority", 0) or 0)
+        for row in list_product_component_groups(product_id)
+    }
+    result: list[dict] = []
+    for group in groups:
+        gid = int(group["id"])
+        priority = memberships.get(gid)
+        result.append(
+            {
+                "id": gid,
+                "code": group.get("code"),
+                "name": group.get("name"),
+                "note": group.get("note"),
+                "is_member": gid in memberships,
+                "priority": priority,
+            }
+        )
+    return result
+
+
+def list_all_slots_with_product_flag(product_id: int) -> list[dict]:
+    slots = list_assembly_slots()
+    covered_ids = {row["slot_id"] for row in list_product_slot_coverage(product_id)}
+    return [
+        {
+            "id": int(slot["id"]),
+            "code": slot.get("code"),
+            "name": slot.get("name"),
+            "note": slot.get("note"),
+            "is_covered": int(slot["id"]) in covered_ids,
+        }
+        for slot in slots
+    ]
 
 
 # Warehouses and channels
