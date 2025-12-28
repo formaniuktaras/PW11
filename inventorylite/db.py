@@ -63,6 +63,13 @@ def normalize_supplier_sku(raw: str | None) -> str | None:
     return cleaned
 
 
+def normalize_external_sku(raw: str) -> str:
+    cleaned = _strip_weird(raw).strip()
+    if not cleaned:
+        raise ValueError("Зовнішній SKU порожній/некоректний")
+    return cleaned
+
+
 def _normalize_date(raw: str, field_label: str = "Дата") -> str:
     return dates.normalize_date_to_iso(raw, field_label=field_label)
 
@@ -352,6 +359,25 @@ def init_db() -> None:
                 ON ProductSupplierCodes(supplier_id, lower(trim(supplier_sku)));
             CREATE INDEX IF NOT EXISTS idx_psc_product
                 ON ProductSupplierCodes(product_id);
+
+            CREATE TABLE IF NOT EXISTS ProductChannelCodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                external_sku TEXT NOT NULL,
+                external_name TEXT,
+                is_primary INTEGER NOT NULL DEFAULT 1,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                last_seen_at TEXT,
+                note TEXT,
+                FOREIGN KEY (channel_id) REFERENCES SalesChannels(id) ON DELETE CASCADE,
+                FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pcc_channel_sku
+                ON ProductChannelCodes(channel_id, lower(trim(external_sku)));
+            CREATE INDEX IF NOT EXISTS idx_pcc_product ON ProductChannelCodes(product_id);
+            CREATE INDEX IF NOT EXISTS idx_pcc_channel ON ProductChannelCodes(channel_id);
+            CREATE INDEX IF NOT EXISTS idx_pcc_active ON ProductChannelCodes(is_active);
 
             CREATE TABLE IF NOT EXISTS ProductBarcodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -886,6 +912,25 @@ def _migrate_schema(conn: sqlite3.Connection, *, commit: bool = True) -> None:
         CREATE INDEX IF NOT EXISTS idx_psc_product
             ON ProductSupplierCodes(product_id);
 
+        CREATE TABLE IF NOT EXISTS ProductChannelCodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            external_sku TEXT NOT NULL,
+            external_name TEXT,
+            is_primary INTEGER NOT NULL DEFAULT 1,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            last_seen_at TEXT,
+            note TEXT,
+            FOREIGN KEY (channel_id) REFERENCES SalesChannels(id) ON DELETE CASCADE,
+            FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pcc_channel_sku
+            ON ProductChannelCodes(channel_id, lower(trim(external_sku)));
+        CREATE INDEX IF NOT EXISTS idx_pcc_product ON ProductChannelCodes(product_id);
+        CREATE INDEX IF NOT EXISTS idx_pcc_channel ON ProductChannelCodes(channel_id);
+        CREATE INDEX IF NOT EXISTS idx_pcc_active ON ProductChannelCodes(is_active);
+
         CREATE TABLE IF NOT EXISTS ProductBarcodes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             product_id INTEGER NOT NULL,
@@ -1211,6 +1256,21 @@ def _ensure_case_insensitive_uniques(conn: sqlite3.Connection, *, use_transactio
             [f"  supplier_id={row['supplier_id']} {row['key']}: {row['items']}" for row in supplier_rows]
         )
 
+    channel_rows = conn.execute(
+        """
+        SELECT channel_id, lower(trim(external_sku)) AS key,
+               group_concat(id || ':' || external_sku, ', ') AS items, COUNT(*) AS cnt
+        FROM ProductChannelCodes
+        GROUP BY channel_id, lower(trim(external_sku))
+        HAVING cnt > 1
+        """
+    ).fetchall()
+    if channel_rows:
+        conflicts.append("Дублікати кодів каналів (без урахування регістру):")
+        conflicts.extend(
+            [f"  channel_id={row['channel_id']} {row['key']}: {row['items']}" for row in channel_rows]
+        )
+
     if conflicts:
         raise ValueError(
             "Знайдено конфлікти для унікальності без урахування регістру. "
@@ -1223,12 +1283,16 @@ def _ensure_case_insensitive_uniques(conn: sqlite3.Connection, *, use_transactio
         conn.execute("DROP INDEX IF EXISTS idx_products_sku_lower")
         conn.execute("DROP INDEX IF EXISTS idx_pb_code_lower")
         conn.execute("DROP INDEX IF EXISTS idx_psc_supplier_sku_lower")
+        conn.execute("DROP INDEX IF EXISTS idx_pcc_channel_sku")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_products_sku_lower ON Products(lower(trim(sku)))"
         )
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pb_code_lower ON ProductBarcodes(lower(trim(code)))")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_psc_supplier_sku_lower ON ProductSupplierCodes(supplier_id, lower(trim(supplier_sku)))"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pcc_channel_sku ON ProductChannelCodes(channel_id, lower(trim(external_sku)))"
         )
 
 
@@ -2060,6 +2124,185 @@ def replace_product_supplier_codes(product_id: int, codes: list[dict]) -> None:
                     "INSERT INTO ProductSupplierCodes (product_id, supplier_id, supplier_sku, is_primary) VALUES (?,?,?,?)",
                     sanitized,
                 )
+
+
+def get_product_id_by_channel_sku(channel_id: int, external_sku: str) -> Optional[int]:
+    external_sku = normalize_external_sku(external_sku)
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT product_id
+            FROM ProductChannelCodes
+            WHERE channel_id=? AND lower(trim(external_sku))=lower(trim(?)) AND is_active=1
+            LIMIT 1
+            """,
+            (channel_id, external_sku),
+        ).fetchone()
+        return int(row["product_id"]) if row else None
+
+
+def list_channel_codes_for_product(product_id: int) -> list[sqlite3.Row]:
+    query = """
+        SELECT pcc.id,
+               pcc.channel_id,
+               sc.name AS channel_name,
+               pcc.external_sku,
+               pcc.external_name,
+               pcc.is_primary,
+               pcc.is_active,
+               pcc.last_seen_at,
+               pcc.note
+        FROM ProductChannelCodes pcc
+        JOIN SalesChannels sc ON sc.id = pcc.channel_id
+        WHERE pcc.product_id=?
+        ORDER BY sc.name, pcc.external_sku
+    """
+    with get_connection() as conn:
+        return list(conn.execute(query, (product_id,)))
+
+
+def upsert_channel_code(
+    channel_id: int,
+    product_id: int,
+    external_sku: str,
+    external_name: str | None = None,
+    is_primary: int = 1,
+    is_active: int = 1,
+    note: str | None = None,
+) -> int:
+    external_sku_clean = normalize_external_sku(external_sku)
+    now = datetime.now().isoformat(timespec="seconds")
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, product_id FROM ProductChannelCodes
+            WHERE channel_id=? AND lower(trim(external_sku))=lower(trim(?))
+            LIMIT 1
+            """,
+            (channel_id, external_sku_clean),
+        ).fetchone()
+        if row:
+            existing_id = int(row["id"])
+            try:
+                conn.execute(
+                    """
+                    UPDATE ProductChannelCodes
+                    SET product_id=?, is_primary=?, is_active=?, external_name=?, last_seen_at=?, note=?
+                    WHERE id=?
+                    """,
+                    (
+                        product_id,
+                        1 if is_primary else 0,
+                        1 if is_active else 0,
+                        (external_name or "").strip() or None,
+                        now,
+                        (note or "").strip() or None,
+                        existing_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"SKU '{external_sku_clean}' вже використовується для іншого товару у цьому каналі.") from exc
+            conn.commit()
+            return existing_id
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO ProductChannelCodes (
+                    channel_id, product_id, external_sku, external_name, is_primary, is_active, last_seen_at, note
+                ) VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    channel_id,
+                    product_id,
+                    external_sku_clean,
+                    (external_name or "").strip() or None,
+                    1 if is_primary else 0,
+                    1 if is_active else 0,
+                    now,
+                    (note or "").strip() or None,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"SKU '{external_sku_clean}' вже прив'язаний до іншого товару у цьому каналі.") from exc
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def delete_channel_code(id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM ProductChannelCodes WHERE id=?", (id,))
+        conn.commit()
+
+
+def touch_channel_code_seen(channel_id: int, external_sku: str, external_name: str | None = None) -> None:
+    external_sku_clean = normalize_external_sku(external_sku)
+    now = datetime.now().isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE ProductChannelCodes
+            SET last_seen_at=?, external_name=COALESCE(?, external_name)
+            WHERE channel_id=? AND lower(trim(external_sku))=lower(trim(?))
+            """,
+            (now, (external_name or "").strip() or None, channel_id, external_sku_clean),
+        )
+        conn.commit()
+
+
+def bulk_upsert_channel_codes(rows: list[dict]) -> dict:
+    inserted = updated = skipped = 0
+    errors: list[str] = []
+    for idx, row in enumerate(rows, start=1):
+        try:
+            channel_id = int(row.get("channel_id"))  # type: ignore[arg-type]
+            product_id = int(row.get("product_id"))  # type: ignore[arg-type]
+            external_sku = normalize_external_sku(row.get("external_sku") or "")
+        except Exception:
+            skipped += 1
+            errors.append(f"Рядок {idx}: некоректні channel_id/product_id/external_sku")
+            continue
+        external_name = row.get("external_name")
+        is_primary = 1 if row.get("is_primary", 1) else 0
+        is_active = 1 if row.get("is_active", 1) else 0
+        note = row.get("note")
+        try:
+            existing = get_product_id_by_channel_sku(channel_id, external_sku)
+            upsert_channel_code(
+                channel_id,
+                product_id,
+                external_sku,
+                external_name=external_name,
+                is_primary=is_primary,
+                is_active=is_active,
+                note=note,
+            )
+            if existing and existing == product_id:
+                updated += 1
+            elif existing:
+                updated += 1
+            else:
+                inserted += 1
+        except ValueError as exc:
+            errors.append(f"Рядок {idx}: {exc}")
+            skipped += 1
+    return {"inserted": inserted, "updated": updated, "skipped": skipped, "errors": errors}
+
+
+def find_products_by_internal_sku(internal_sku: str) -> list[dict]:
+    try:
+        normalized = normalize_sku(internal_sku)
+    except ValueError:
+        return []
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, sku, name FROM Products WHERE lower(trim(sku))=lower(trim(?))",
+            (normalized,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_sales_channels() -> List[sqlite3.Row]:
+    return list_channels(active_only=False)
 
 
 def list_product_barcodes(product_id: int) -> list[sqlite3.Row]:
