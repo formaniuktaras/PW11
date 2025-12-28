@@ -351,6 +351,17 @@ class ProductsTab:
             return
         ProductAssemblyConfigDialog(self.frame, product)
 
+    def open_product_channel_codes(self) -> None:
+        product_id = self.product_table.selected_id()
+        if not product_id:
+            show_error("Оберіть товар")
+            return
+        product = db.get_product(int(product_id))
+        if not product:
+            show_error("Коди каналів", "Товар не знайдено.")
+            return
+        ProductChannelCodesDialog(self.frame, product)
+
 
 class ProductChannelCodesDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, product: dict) -> None:
@@ -523,17 +534,6 @@ class ProductChannelCodesDialog(tk.Toplevel):
         except Exception:
             logging.exception("Failed to delete channel code")
             show_error("Коди каналів", "Не вдалося видалити код.")
-
-    def open_product_channel_codes(self) -> None:
-        product_id = self.product_table.selected_id()
-        if not product_id:
-            show_error("Коди каналів", "Оберіть товар.")
-            return
-        product = db.get_product(int(product_id))
-        if not product:
-            show_error("Коди каналів", "Товар не знайдено.")
-            return
-        ProductChannelCodesDialog(self.frame, product)
 
     def _process_product_import(self, rows: list[dict], options: dict) -> str:
         mode = options.get("mode", "create")
