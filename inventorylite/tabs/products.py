@@ -10,6 +10,7 @@ from typing import Optional, Callable
 
 from inventorylite import db
 from inventorylite import labels
+from inventorylite import assembly_resolver
 from inventorylite.label_templates_ui import TemplateManagerDialog
 from inventorylite.ui_components import TableFrame, simple_prompt
 from inventorylite.utils import (
@@ -668,6 +669,9 @@ class ProductAssemblyConfigDialog(tk.Toplevel):
         self.product_id = int(product["id"])
         self.groups: list[dict] = []
         self.slots: list[dict] = []
+        self.requirements: list[dict] = []
+        self.all_slots: list[dict] = []
+        self.all_groups: list[dict] = []
 
         main = ttk.Frame(self, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
@@ -683,11 +687,11 @@ class ProductAssemblyConfigDialog(tk.Toplevel):
         )
         info.pack(fill=tk.X, pady=(0, 8))
 
-        tables = ttk.Frame(main)
-        tables.pack(fill=tk.BOTH, expand=True)
+        notebook = ttk.Notebook(main)
+        notebook.pack(fill=tk.BOTH, expand=True)
 
-        group_frame = ttk.LabelFrame(tables, text="Групи (взаємозамінність)")
-        group_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+        group_frame = ttk.Frame(notebook)
+        notebook.add(group_frame, text="Групи")
         group_columns = [
             ("code", "Код", 140),
             ("name", "Назва", 220),
@@ -695,22 +699,43 @@ class ProductAssemblyConfigDialog(tk.Toplevel):
             ("priority", "Пріоритет", 90),
         ]
         self.group_table = TableFrame(group_frame, group_columns, height=12)
-        self.group_table.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.group_table.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.group_table.on_double_click(self._toggle_group_membership)
 
-        slot_frame = ttk.LabelFrame(tables, text="Слоти, які покриває товар")
-        slot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+        slot_frame = ttk.Frame(notebook)
+        notebook.add(slot_frame, text="Покриття")
         slot_columns = [
             ("code", "Код", 160),
             ("name", "Назва", 220),
             ("is_covered", "Покриває", 90),
         ]
         self.slot_table = TableFrame(slot_frame, slot_columns, height=12)
-        self.slot_table.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.slot_table.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.slot_table.on_double_click(self._toggle_slot_coverage)
+
+        req_frame = ttk.Frame(notebook)
+        notebook.add(req_frame, text="Вимоги (слоти)")
+        req_columns = [
+            ("slot_code", "Код слоту", 140),
+            ("slot_name", "Назва слоту", 220),
+            ("qty", "Кількість", 100),
+            ("group_code", "Група", 140),
+        ]
+        self.requirement_table = TableFrame(req_frame, req_columns, height=12)
+        self.requirement_table.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
+        self.requirement_table.on_double_click(self._edit_requirement)
+
+        req_btns = ttk.Frame(req_frame)
+        req_btns.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Button(req_btns, text="Додати", command=self._add_requirement).pack(side=tk.LEFT, padx=4)
+        ttk.Button(req_btns, text="Змінити", command=self._edit_requirement).pack(side=tk.LEFT, padx=4)
+        ttk.Button(req_btns, text="Видалити", command=self._delete_requirement).pack(side=tk.LEFT, padx=4)
 
         btns = ttk.Frame(main)
         btns.pack(fill=tk.X, pady=6)
+        ttk.Button(btns, text="Підібрати компоненти…", command=self._preview_components).pack(
+            side=tk.RIGHT, padx=4
+        )
         ttk.Button(btns, text="Оновити", command=self.refresh_data).pack(side=tk.RIGHT, padx=4)
         ttk.Button(btns, text="Закрити", command=self.destroy).pack(side=tk.RIGHT, padx=4)
 
@@ -722,6 +747,9 @@ class ProductAssemblyConfigDialog(tk.Toplevel):
         try:
             self.groups = db.list_all_groups_with_product_flag(self.product_id)
             self.slots = db.list_all_slots_with_product_flag(self.product_id)
+            self.requirements = db.list_product_requirements(self.product_id)
+            self.all_slots = db.list_assembly_slots()
+            self.all_groups = db.list_component_groups()
         except Exception:
             logging.exception("Failed to load assemblies data for product")
             show_error("Комплектація", "Не вдалося завантажити дані комплектування.")
@@ -748,6 +776,18 @@ class ProductAssemblyConfigDialog(tk.Toplevel):
                     "is_covered": "Так" if s.get("is_covered") else "Ні",
                 }
                 for s in self.slots
+            ]
+        )
+        self.requirement_table.set_rows(
+            [
+                {
+                    "id": r["slot_id"],
+                    "slot_code": r.get("slot_code"),
+                    "slot_name": r.get("slot_name"),
+                    "qty": r.get("qty"),
+                    "group_code": r.get("group_code") or "",
+                }
+                for r in self.requirements
             ]
         )
 
@@ -802,6 +842,238 @@ class ProductAssemblyConfigDialog(tk.Toplevel):
             show_error("Комплектація", "Не вдалося змінити покриття слоту.")
         finally:
             self.refresh_data()
+
+    def _get_slot_by_id(self, slot_id: int) -> Optional[dict]:
+        return next((s for s in self.all_slots if int(s["id"]) == int(slot_id)), None)
+
+    def _add_requirement(self) -> None:
+        self._open_requirement_editor(None)
+
+    def _edit_requirement(self) -> None:
+        selection = self.requirement_table.selected_id()
+        if selection is None:
+            show_error("Комплектація", "Оберіть вимогу для редагування.")
+            return
+        req = next((r for r in self.requirements if int(r["slot_id"]) == int(selection)), None)
+        if req is None:
+            show_error("Комплектація", "Не знайдено дані вимоги.")
+            return
+        self._open_requirement_editor(req)
+
+    def _open_requirement_editor(self, existing: Optional[dict]) -> None:
+        if not self.all_slots:
+            show_error("Вимоги", "Немає доступних слотів.")
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Вимога по слоту")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Слот:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        slot_options = [f"{s.get('code')} — {s.get('name')}" for s in self.all_slots]
+        slot_ids = [int(s["id"]) for s in self.all_slots]
+        slot_var = tk.StringVar()
+        slot_combo = ttk.Combobox(dlg, textvariable=slot_var, values=slot_options, state="readonly", width=40)
+        slot_combo.grid(row=0, column=1, sticky="w", padx=8, pady=6)
+
+        ttk.Label(dlg, text="Кількість на 1 шт.:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        qty_var = tk.StringVar(value=str(existing.get("qty") if existing else "1"))
+        qty_entry = ttk.Entry(dlg, textvariable=qty_var, width=12)
+        qty_entry.grid(row=1, column=1, sticky="w", padx=8, pady=6)
+
+        ttk.Label(dlg, text="Бажана група:").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        group_options = ["(будь-яка) / None"] + [f"{g.get('code')} — {g.get('name')}" for g in self.all_groups]
+        group_ids = [None] + [int(g["id"]) for g in self.all_groups]
+        group_var = tk.StringVar()
+        group_combo = ttk.Combobox(dlg, textvariable=group_var, values=group_options, state="readonly", width=40)
+        group_combo.grid(row=2, column=1, sticky="w", padx=8, pady=6)
+
+        if existing:
+            try:
+                idx = slot_ids.index(int(existing["slot_id"]))
+                slot_combo.current(idx)
+            except ValueError:
+                slot_combo.set("")
+            if existing.get("group_id") is not None:
+                try:
+                    gidx = group_ids.index(int(existing["group_id"]))
+                    group_combo.current(gidx)
+                except ValueError:
+                    group_combo.set("")
+            else:
+                group_combo.current(0)
+            slot_combo.state(["disabled"])
+        else:
+            if slot_options:
+                slot_combo.current(0)
+            group_combo.current(0)
+
+        result: dict = {}
+
+        def on_ok() -> None:
+            try:
+                qty_value = float(qty_var.get())
+            except ValueError:
+                show_error("Вимоги", "Кількість має бути числом.")
+                return
+            if qty_value <= 0:
+                show_error("Вимоги", "Кількість має бути більшою за 0.")
+                return
+
+            try:
+                slot_idx = slot_options.index(slot_var.get())
+                slot_id = slot_ids[slot_idx]
+            except ValueError:
+                show_error("Вимоги", "Оберіть слот.")
+                return
+
+            group_id: Optional[int] = None
+            if group_var.get() in group_options and group_options.index(group_var.get()) > 0:
+                group_id = group_ids[group_options.index(group_var.get())]
+
+            try:
+                db.upsert_product_requirement(self.product_id, int(slot_id), qty_value, group_id)
+            except sqlite3.IntegrityError:
+                show_error("Вимоги", "Не вдалося зберегти вимогу. Перевірте унікальність.")
+                return
+            except Exception:
+                logging.exception("Failed to save product requirement")
+                show_error("Вимоги", "Не вдалося зберегти вимогу.")
+                return
+            result["saved"] = True
+            dlg.destroy()
+
+        ttk.Button(dlg, text="Скасувати", command=dlg.destroy).grid(row=3, column=0, padx=8, pady=8, sticky="e")
+        ttk.Button(dlg, text="Зберегти", command=on_ok).grid(row=3, column=1, padx=8, pady=8, sticky="w")
+        dlg.bind("<Return>", lambda _e: on_ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        qty_entry.focus_set()
+        dlg.wait_window()
+        if result.get("saved"):
+            self.refresh_data()
+
+    def _delete_requirement(self) -> None:
+        selection = self.requirement_table.selected_id()
+        if selection is None:
+            show_error("Комплектація", "Оберіть вимогу для видалення.")
+            return
+        slot = self._get_slot_by_id(int(selection))
+        confirm_label = slot.get("code") if slot else str(selection)
+        if not messagebox.askyesno("Вимоги", f"Видалити вимогу для слоту {confirm_label}?"):
+            return
+        try:
+            db.delete_product_requirement(self.product_id, int(selection))
+        except Exception:
+            logging.exception("Failed to delete requirement")
+            show_error("Вимоги", "Не вдалося видалити вимогу.")
+        finally:
+            self.refresh_data()
+
+    def _preview_components(self) -> None:
+        params = self._ask_preview_params()
+        if not params:
+            return
+        qty, warehouse_id = params
+        try:
+            result = assembly_resolver.resolve_components_for_product(self.product_id, warehouse_id, qty)
+        except Exception:
+            logging.exception("Failed to resolve components")
+            show_error("Підбір компонентів", "Не вдалося підібрати компоненти.")
+            return
+
+        lines: list[str] = []
+        components = result.get("components") or []
+        if components:
+            lines.append("Компоненти:")
+            for comp in components:
+                lines.append(f"- {comp.get('sku')}: {comp.get('name')} — {comp.get('qty')}")
+        else:
+            lines.append("Компоненти не знайдені.")
+
+        missing_slots = result.get("missing_slots") or []
+        if missing_slots:
+            lines.append("")
+            lines.append("НЕ ВИСТАЧАЄ:")
+            for miss in missing_slots:
+                label = miss.get("slot_code") or miss.get("slot_name") or "slot"
+                lines.append(f"- {label}: {miss.get('missing_qty')}")
+
+        messagebox.showinfo("Підібрати компоненти", "\n".join(lines), parent=self)
+
+    def _ask_preview_params(self) -> Optional[tuple[float, int]]:
+        warehouses = db.list_warehouses(active_only=True)
+        if not warehouses:
+            show_error("Підбір компонентів", "Немає доступних складів.")
+            return None
+        if len(warehouses) == 1:
+            values = simple_prompt(
+                "Підібрати компоненти",
+                ["Кількість готових одиниць"],
+                ["1"],
+            )
+            if not values:
+                return None
+            try:
+                qty = float(values[0])
+            except ValueError:
+                show_error("Підбір компонентів", "Кількість має бути числом.")
+                return None
+            if qty <= 0:
+                show_error("Підбір компонентів", "Кількість має бути більшою за 0.")
+                return None
+            return qty, int(warehouses[0]["id"])
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Параметри підбору")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Кількість готових одиниць:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        qty_var = tk.StringVar(value="1")
+        qty_entry = ttk.Entry(dlg, textvariable=qty_var, width=12)
+        qty_entry.grid(row=0, column=1, sticky="w", padx=8, pady=6)
+
+        ttk.Label(dlg, text="Склад:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        wh_options = [f"{w['name']} (#{w['id']})" for w in warehouses]
+        wh_ids = [int(w["id"]) for w in warehouses]
+        wh_var = tk.StringVar(value=wh_options[0])
+        wh_combo = ttk.Combobox(dlg, textvariable=wh_var, values=wh_options, state="readonly", width=30)
+        wh_combo.grid(row=1, column=1, sticky="w", padx=8, pady=6)
+
+        result: dict = {}
+
+        def on_ok() -> None:
+            try:
+                qty_val = float(qty_var.get())
+            except ValueError:
+                show_error("Підбір компонентів", "Кількість має бути числом.")
+                return
+            if qty_val <= 0:
+                show_error("Підбір компонентів", "Кількість має бути більшою за 0.")
+                return
+            try:
+                wh_idx = wh_options.index(wh_var.get())
+                wh_id = wh_ids[wh_idx]
+            except ValueError:
+                show_error("Підбір компонентів", "Оберіть склад.")
+                return
+            result["qty"] = qty_val
+            result["warehouse_id"] = wh_id
+            dlg.destroy()
+
+        ttk.Button(dlg, text="Скасувати", command=dlg.destroy).grid(row=2, column=0, padx=8, pady=10, sticky="e")
+        ttk.Button(dlg, text="OK", command=on_ok).grid(row=2, column=1, padx=8, pady=10, sticky="w")
+        dlg.bind("<Return>", lambda _e: on_ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        qty_entry.focus_set()
+        dlg.wait_window()
+
+        if "qty" in result and "warehouse_id" in result:
+            return float(result["qty"]), int(result["warehouse_id"])
+        return None
 
 
 class ProductsImportDialog(tk.Toplevel):
