@@ -35,6 +35,7 @@ from inventorylite.helpers import (
     _parse_date_value,
     _parse_float_value,
     _parse_num,
+    parse_import_file,
 )
 from inventorylite.dialogs_labels import open_labels_print_dialog
 from inventorylite.tabs.categories import CategoriesTab
@@ -215,6 +216,12 @@ class InventoryApp(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label="Вихід", command=self.on_exit)
         menubar.add_cascade(label="Файл", menu=file_menu)
+        service_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu = tk.Menu(service_menu, tearoff=0)
+        tools_menu.add_command(label="Імпорт відповідностей SKU (канали)", command=self.import_channel_code_mappings)
+        tools_menu.add_command(label="Експорт відповідностей SKU (канали)", command=self.export_channel_code_mappings)
+        service_menu.add_cascade(label="Інструменти", menu=tools_menu)
+        menubar.add_cascade(label="Сервіс", menu=service_menu)
         diagnostics_menu = tk.Menu(menubar, tearoff=0)
         diagnostics_menu.add_command(
             label="Відкрити теку даних", command=lambda: open_data_folder(get_data_dir())
@@ -407,6 +414,138 @@ class InventoryApp(tk.Tk):
             messagebox.showinfo("Швидкий ремонт БД", "Готово")
         else:
             messagebox.showerror("Швидкий ремонт БД", result.get("error", "Невідома помилка"))
+
+    def import_channel_code_mappings(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="Імпорт відповідностей SKU (канали)",
+            initialdir=str(self.default_workdir()),
+            filetypes=(
+                ("Таблиці", "*.csv *.xlsx *.xls"),
+                ("CSV", "*.csv"),
+                ("Excel", "*.xlsx;*.xls"),
+                ("Усі файли", "*.*"),
+            ),
+        )
+        if not file_path:
+            return
+        try:
+            raw_rows, _headers = parse_import_file(
+                Path(file_path),
+                encoding=self.settings.get("files", "encoding") or "utf-8",
+            )
+        except Exception as exc:
+            logging.exception("Не вдалося прочитати файл імпорту відповідностей SKU")
+            show_error("Імпорт відповідностей", "Не вдалося прочитати файл. " + str(exc))
+            return
+        if not raw_rows:
+            messagebox.showinfo("Імпорт відповідностей", "У файлі не знайдено рядків.")
+            return
+
+        channels = db.list_channels(active_only=False)
+        if not channels:
+            show_error("Імпорт відповідностей", "Спочатку додайте канали продажів.")
+            return
+        channels_by_name = {c["name"].strip().lower(): c for c in channels if c.get("name")}
+
+        prepared_rows: list[dict] = []
+        errors: list[str] = []
+        skipped = 0
+
+        for idx, row in enumerate(raw_rows, start=1):
+            channel_raw = _format_cell_value(row.get("channel") or row.get("channel_name") or "").strip()
+            external_sku = _format_cell_value(row.get("external_sku") or "").strip()
+            internal_sku = _format_cell_value(row.get("internal_sku") or "").strip()
+
+            if not channel_raw or not external_sku or not internal_sku:
+                errors.append(f"Рядок {idx}: відсутні обов'язкові поля (channel/external_sku/internal_sku).")
+                skipped += 1
+                continue
+
+            channel_row = channels_by_name.get(channel_raw.lower())
+            if not channel_row:
+                errors.append(f"Рядок {idx}: канал '{channel_raw}' не знайдено.")
+                skipped += 1
+                continue
+
+            matches = db.find_products_by_internal_sku(internal_sku)
+            if not matches:
+                errors.append(f"Рядок {idx}: товар зі SKU '{internal_sku}' не знайдено.")
+                skipped += 1
+                continue
+            if len(matches) > 1:
+                errors.append(f"Рядок {idx}: знайдено кілька товарів зі SKU '{internal_sku}'. Уточніть SKU.")
+                skipped += 1
+                continue
+
+            is_active_raw = _parse_bool_value(_format_cell_value(row.get("is_active")))
+            is_active = 1 if is_active_raw is None else is_active_raw
+            note = _format_cell_value(row.get("note") or "").strip() or None
+            prepared_rows.append(
+                {
+                    "channel_id": channel_row["id"],
+                    "product_id": int(matches[0]["id"]),
+                    "external_sku": external_sku,
+                    "is_active": is_active,
+                    "note": note,
+                }
+            )
+
+        result = (
+            db.bulk_upsert_channel_codes(prepared_rows)
+            if prepared_rows
+            else {"inserted": 0, "updated": 0, "skipped": 0, "errors": []}
+        )
+        inserted = result.get("inserted", 0)
+        updated = result.get("updated", 0)
+        skipped += result.get("skipped", 0)
+        errors.extend(result.get("errors", []))
+
+        summary_lines = [
+            f"Додано: {inserted}",
+            f"Оновлено: {updated}",
+            f"Пропущено: {skipped}",
+        ]
+        if errors:
+            summary_lines.append("Помилки:")
+            summary_lines.extend(errors)
+            messagebox.showwarning("Імпорт відповідностей", "\n".join(summary_lines))
+        else:
+            messagebox.showinfo("Імпорт відповідностей", "\n".join(summary_lines))
+
+    def export_channel_code_mappings(self) -> None:
+        codes = db.list_all_channel_codes()
+        if not codes:
+            messagebox.showinfo("Експорт відповідностей", "Немає даних для експорту.")
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target_path = filedialog.asksaveasfilename(
+            title="Експорт відповідностей SKU (канали)",
+            defaultextension=".csv",
+            initialfile=f"channel_codes_{timestamp}.csv",
+            initialdir=str(self.default_workdir()),
+            filetypes=(("CSV", "*.csv"), ("Усі файли", "*.*")),
+        )
+        if not target_path:
+            return
+        try:
+            with open(target_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["channel_name", "external_sku", "internal_sku", "is_active", "note", "last_seen_at"])
+                for row in codes:
+                    writer.writerow(
+                        [
+                            row["channel_name"],
+                            row["external_sku"],
+                            row["internal_sku"],
+                            1 if row["is_active"] else 0,
+                            row["note"] or "",
+                            row["last_seen_at"] or "",
+                        ]
+                    )
+            messagebox.showinfo("Експорт відповідностей", f"Експортовано рядків: {len(codes)}")
+        except Exception:
+            logging.exception("Не вдалося експортувати відповідності SKU")
+            show_error("Експорт відповідностей", "Не вдалося експортувати дані. Деталі у логах.")
 
     def default_workdir(self) -> Path:
         path = self.settings.get("files", "working_dir") or str(get_data_dir())

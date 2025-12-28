@@ -609,6 +609,16 @@ class SalesTab:
             mapping_result = dlg.result.get("mappings", {}) if dlg.result else {}
             created_products += dlg.result.get("created_products", 0) if dlg.result else 0
 
+        unresolved_items = [
+            item for key, item in unmapped_items.items() if key not in mapping_result
+        ]
+        if unresolved_items:
+            lines = [
+                f"Канал: {item.get('channel_name', '')} | SKU: {item.get('external_sku', '')} | Назва: {item.get('external_name') or '-'}"
+                for item in unresolved_items
+            ]
+            raise ValueError("Не всі SKU розпізнані. Імпорт скасовано.\n" + "\n".join(lines))
+
         for order in prepared_orders:
             sale_lines: list[tuple[int, float, float, float]] = []
             for line in order["lines"]:
@@ -709,7 +719,15 @@ class SalesImportDialog(tk.Toplevel):
         main = ttk.Frame(self, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
 
-        info = ttk.Label(main, text=f"Рядків у файлі: {len(raw_rows)}")
+        info = ttk.Label(
+            main,
+            text=(
+                f"Рядків у файлі: {len(raw_rows)}\n"
+                "Ключ — (Канал + SKU). Якщо SKU не розпізнано — спочатку створіть відповідність."
+            ),
+            wraplength=560,
+            justify="left",
+        )
         info.grid(row=0, column=0, columnspan=3, sticky="w")
 
         self._build_template_controls(main)
