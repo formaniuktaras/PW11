@@ -30,7 +30,7 @@ from inventorylite.text_norm import norm_text
 from inventorylite.utils import get_db_path
 
 
-LATEST_SCHEMA_VERSION = 2
+LATEST_SCHEMA_VERSION = 3
 
 
 def _strip_weird(value: str | None) -> str:
@@ -403,12 +403,25 @@ def init_db() -> None:
                 FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE,
                 FOREIGN KEY (slot_id) REFERENCES AssemblySlots(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS ProductAssemblyRequirements (
+                product_id INTEGER NOT NULL,
+                slot_id INTEGER NOT NULL,
+                group_id INTEGER,
+                qty REAL NOT NULL DEFAULT 1,
+                PRIMARY KEY (product_id, slot_id),
+                FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE,
+                FOREIGN KEY (slot_id) REFERENCES AssemblySlots(id) ON DELETE CASCADE,
+                FOREIGN KEY (group_id) REFERENCES ComponentGroups(id) ON DELETE SET NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_component_groups_code_lower ON ComponentGroups(lower(trim(code)));
             CREATE INDEX IF NOT EXISTS idx_assembly_slots_code_lower ON AssemblySlots(lower(trim(code)));
             CREATE INDEX IF NOT EXISTS idx_pcm_product ON ProductComponentGroupMembers(product_id);
             CREATE INDEX IF NOT EXISTS idx_pcm_group ON ProductComponentGroupMembers(group_id);
-            CREATE INDEX IF NOT EXISTS idx_psc_product ON ProductSlotCoverage(product_id);
-            CREATE INDEX IF NOT EXISTS idx_psc_slot ON ProductSlotCoverage(slot_id);
+            CREATE INDEX IF NOT EXISTS idx_slotcov_product_id ON ProductSlotCoverage(product_id);
+            CREATE INDEX IF NOT EXISTS idx_slotcov_slot_id ON ProductSlotCoverage(slot_id);
+            CREATE INDEX IF NOT EXISTS idx_par_product ON ProductAssemblyRequirements(product_id);
+            CREATE INDEX IF NOT EXISTS idx_par_slot ON ProductAssemblyRequirements(slot_id);
+            CREATE INDEX IF NOT EXISTS idx_par_group ON ProductAssemblyRequirements(group_id);
 
             CREATE INDEX IF NOT EXISTS idx_products_sku_lower ON Products(lower(trim(sku)));
             CREATE INDEX IF NOT EXISTS idx_products_name_lower ON Products(lower(name));
@@ -700,6 +713,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
                 _migration_v1_baseline(conn)
             elif v == 2:
                 _migration_v2_audit_log(conn)
+            elif v == 3:
+                _migration_v3_assembly_requirements(conn)
             else:
                 raise RuntimeError(f"Unknown migration step: {v}")
             _set_user_version(conn, v)
@@ -744,6 +759,31 @@ def _migration_v2_audit_log(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_audit_created_at ON AuditLog(created_at);
         CREATE INDEX IF NOT EXISTS idx_audit_event_type ON AuditLog(event_type);
         CREATE INDEX IF NOT EXISTS idx_audit_related ON AuditLog(related_doc_type, related_doc_id);
+        """
+    )
+
+
+def _migration_v3_assembly_requirements(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_psc_product;
+        DROP INDEX IF EXISTS idx_psc_slot;
+        CREATE INDEX IF NOT EXISTS idx_slotcov_product_id ON ProductSlotCoverage(product_id);
+        CREATE INDEX IF NOT EXISTS idx_slotcov_slot_id ON ProductSlotCoverage(slot_id);
+
+        CREATE TABLE IF NOT EXISTS ProductAssemblyRequirements (
+          product_id INTEGER NOT NULL,
+          slot_id INTEGER NOT NULL,
+          group_id INTEGER,
+          qty REAL NOT NULL DEFAULT 1,
+          PRIMARY KEY (product_id, slot_id),
+          FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE,
+          FOREIGN KEY (slot_id) REFERENCES AssemblySlots(id) ON DELETE CASCADE,
+          FOREIGN KEY (group_id) REFERENCES ComponentGroups(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_par_product ON ProductAssemblyRequirements(product_id);
+        CREATE INDEX IF NOT EXISTS idx_par_slot ON ProductAssemblyRequirements(slot_id);
+        CREATE INDEX IF NOT EXISTS idx_par_group ON ProductAssemblyRequirements(group_id);
         """
     )
 
@@ -2385,6 +2425,68 @@ def list_all_slots_with_product_flag(product_id: int) -> list[dict]:
         }
         for slot in slots
     ]
+
+
+def list_product_requirements(product_id: int) -> list[dict]:
+    query = """
+        SELECT r.slot_id,
+               s.code AS slot_code,
+               s.name AS slot_name,
+               r.group_id,
+               cg.code AS group_code,
+               cg.name AS group_name,
+               r.qty
+        FROM ProductAssemblyRequirements r
+        JOIN AssemblySlots s ON s.id = r.slot_id
+        LEFT JOIN ComponentGroups cg ON cg.id = r.group_id
+        WHERE r.product_id = ?
+        ORDER BY s.code
+    """
+    with get_connection() as conn:
+        rows = conn.execute(query, (product_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_product_requirement(
+    product_id: int, slot_id: int, qty: float, group_id: int | None = None
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO ProductAssemblyRequirements (product_id, slot_id, group_id, qty)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(product_id, slot_id) DO UPDATE SET group_id=excluded.group_id, qty=excluded.qty
+            """,
+            (product_id, slot_id, group_id, float(qty)),
+        )
+        conn.commit()
+
+
+def delete_product_requirement(product_id: int, slot_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM ProductAssemblyRequirements WHERE product_id=? AND slot_id=?", (product_id, slot_id))
+        conn.commit()
+
+
+def list_group_members(group_id: int) -> list[dict]:
+    query = """
+        SELECT m.product_id, p.sku, p.name, m.priority
+        FROM ProductComponentGroupMembers m
+        JOIN Products p ON p.id = m.product_id
+        WHERE m.group_id = ?
+        ORDER BY m.priority, p.sku
+    """
+    with get_connection() as conn:
+        rows = conn.execute(query, (group_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_product_coverage_slot_ids(product_id: int) -> Set[int]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT slot_id FROM ProductSlotCoverage WHERE product_id=?", (product_id,)
+        ).fetchall()
+    return {int(r["slot_id"]) for r in rows}
 
 
 # Warehouses and channels
