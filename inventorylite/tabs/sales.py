@@ -96,6 +96,7 @@ class SalesTab:
         ttk.Button(btns, text="Видалити", command=self.delete_sale).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Провести", command=self.post_sale_action).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Відмінити проведення", command=self.unpost_sale_action).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Комплектація", command=self.show_assembly_plan).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Імпорт із файлу", command=self.import_sales_from_file).pack(side=tk.LEFT, padx=4)
 
     def _selected_sale(self):
@@ -282,6 +283,72 @@ class SalesTab:
         except Exception as exc:
             logging.exception("Unpost sale error")
             show_error("Продажі", str(exc))
+
+    def show_assembly_plan(self) -> None:
+        doc_id = self._selected_sale()
+        if not doc_id:
+            return
+        try:
+            doc = db.get_sale(doc_id)
+            if not doc:
+                raise ValueError("Документ не знайдено")
+            lines = db.list_sale_lines(doc_id)
+            plans = db.list_sale_assembly_plans(doc_id)
+            products = {p["id"]: p for p in db.list_products()}
+        except Exception as exc:
+            logging.exception("Load assembly plan error")
+            show_error("Продажі", str(exc))
+            return
+
+        plans_by_line = {plan["sale_line_id"]: plan for plan in plans}
+        dlg = tk.Toplevel(self.frame)
+        dlg.title("Комплектація продажу")
+        dlg.transient(self.frame.winfo_toplevel())
+        dlg.resizable(True, True)
+
+        tree = ttk.Treeview(dlg, columns=("qty", "amount"), show="tree headings")
+        tree.heading("#0", text="Рядок")
+        tree.heading("qty", text="К-сть")
+        tree.heading("amount", text="Сума собівар.")
+        tree.column("qty", width=100, anchor="center")
+        tree.column("amount", width=140, anchor="center")
+
+        vsb = ttk.Scrollbar(dlg, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        dlg.grid_columnconfigure(0, weight=1)
+        dlg.grid_rowconfigure(0, weight=1)
+
+        draft_hint_shown = False
+        for line in lines:
+            line_text = f"{line['sku']} — {line['product_name']} (x{line['quantity']})"
+            parent_item = tree.insert("", "end", text=line_text, values=("", ""))
+            plan = plans_by_line.get(line["id"])
+            if plan and plan.get("lines"):
+                for comp in plan["lines"]:
+                    comp_product = products.get(comp["component_product_id"]) or {}
+                    comp_label = f"{comp_product.get('sku', comp['component_product_id'])} — {comp_product.get('name', '')}"
+                    qty_val = float(comp.get("qty") or 0.0)
+                    amount_val = float(comp.get("amount") or 0.0)
+                    tree.insert(
+                        parent_item,
+                        "end",
+                        text=f"• {comp_label}",
+                        values=(f"{qty_val:.4g}", f"{amount_val:.2f}"),
+                    )
+            else:
+                hint = "План створюється при проведенні продажу" if doc["status"] == "draft" else "План відсутній"
+                tree.insert(parent_item, "end", text=hint, values=("", ""))
+                if doc["status"] == "draft":
+                    draft_hint_shown = True
+
+        if draft_hint_shown:
+            ttk.Label(dlg, text="План буде згенерований під час проведення продажу.").grid(
+                row=1, column=0, columnspan=2, sticky="w", padx=8, pady=6
+            )
+        ttk.Button(dlg, text="Закрити", command=dlg.destroy).grid(row=2, column=0, columnspan=2, pady=6)
+        dlg.grab_set()
 
     def import_sales_from_file(self) -> None:
         file_path = filedialog.askopenfilename(
