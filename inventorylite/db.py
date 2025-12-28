@@ -25,12 +25,12 @@ from pathlib import Path
 from statistics import mean, pstdev
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from inventorylite import utils, dates
+from inventorylite import utils, dates, assembly_resolver
 from inventorylite.text_norm import norm_text
 from inventorylite.utils import get_db_path
 
 
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 4
 
 
 def _strip_weird(value: str | None) -> str:
@@ -505,6 +505,34 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_sales_lines_sale ON SalesLines(sale_id);
 
+            CREATE TABLE IF NOT EXISTS SaleAssemblyPlans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sale_id INTEGER NOT NULL,
+                sale_line_id INTEGER NOT NULL UNIQUE,
+                parent_product_id INTEGER NOT NULL,
+                warehouse_id INTEGER NOT NULL,
+                parent_qty REAL NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (sale_id) REFERENCES SalesDocuments(id) ON DELETE CASCADE,
+                FOREIGN KEY (sale_line_id) REFERENCES SalesLines(id) ON DELETE CASCADE,
+                FOREIGN KEY (parent_product_id) REFERENCES Products(id),
+                FOREIGN KEY (warehouse_id) REFERENCES Warehouses(id)
+            );
+            CREATE TABLE IF NOT EXISTS SaleAssemblyPlanLines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id INTEGER NOT NULL,
+                component_product_id INTEGER NOT NULL,
+                qty REAL NOT NULL,
+                cost_per_unit REAL NOT NULL,
+                amount REAL NOT NULL,
+                details_json TEXT,
+                FOREIGN KEY (plan_id) REFERENCES SaleAssemblyPlans(id) ON DELETE CASCADE,
+                FOREIGN KEY (component_product_id) REFERENCES Products(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sapl_plan ON SaleAssemblyPlanLines(plan_id);
+            CREATE INDEX IF NOT EXISTS idx_sapl_component ON SaleAssemblyPlanLines(component_product_id);
+            CREATE INDEX IF NOT EXISTS idx_sap_sale_id ON SaleAssemblyPlans(sale_id);
+
             CREATE TABLE IF NOT EXISTS InventoryDocuments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 doc_date TEXT NOT NULL,
@@ -715,6 +743,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
                 _migration_v2_audit_log(conn)
             elif v == 3:
                 _migration_v3_assembly_requirements(conn)
+            elif v == 4:
+                _migration_v4_sale_assembly(conn)
             else:
                 raise RuntimeError(f"Unknown migration step: {v}")
             _set_user_version(conn, v)
@@ -784,6 +814,40 @@ def _migration_v3_assembly_requirements(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_par_product ON ProductAssemblyRequirements(product_id);
         CREATE INDEX IF NOT EXISTS idx_par_slot ON ProductAssemblyRequirements(slot_id);
         CREATE INDEX IF NOT EXISTS idx_par_group ON ProductAssemblyRequirements(group_id);
+        """
+    )
+
+
+def _migration_v4_sale_assembly(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS SaleAssemblyPlans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sale_id INTEGER NOT NULL,
+            sale_line_id INTEGER NOT NULL UNIQUE,
+            parent_product_id INTEGER NOT NULL,
+            warehouse_id INTEGER NOT NULL,
+            parent_qty REAL NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (sale_id) REFERENCES SalesDocuments(id) ON DELETE CASCADE,
+            FOREIGN KEY (sale_line_id) REFERENCES SalesLines(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_product_id) REFERENCES Products(id),
+            FOREIGN KEY (warehouse_id) REFERENCES Warehouses(id)
+        );
+        CREATE TABLE IF NOT EXISTS SaleAssemblyPlanLines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL,
+            component_product_id INTEGER NOT NULL,
+            qty REAL NOT NULL,
+            cost_per_unit REAL NOT NULL,
+            amount REAL NOT NULL,
+            details_json TEXT,
+            FOREIGN KEY (plan_id) REFERENCES SaleAssemblyPlans(id) ON DELETE CASCADE,
+            FOREIGN KEY (component_product_id) REFERENCES Products(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sapl_plan ON SaleAssemblyPlanLines(plan_id);
+        CREATE INDEX IF NOT EXISTS idx_sapl_component ON SaleAssemblyPlanLines(component_product_id);
+        CREATE INDEX IF NOT EXISTS idx_sap_sale_id ON SaleAssemblyPlans(sale_id);
         """
     )
 
@@ -2427,7 +2491,7 @@ def list_all_slots_with_product_flag(product_id: int) -> list[dict]:
     ]
 
 
-def list_product_requirements(product_id: int) -> list[dict]:
+def list_product_requirements(product_id: int, conn: sqlite3.Connection | None = None) -> list[dict]:
     query = """
         SELECT r.slot_id,
                s.code AS slot_code,
@@ -2442,9 +2506,15 @@ def list_product_requirements(product_id: int) -> list[dict]:
         WHERE r.product_id = ?
         ORDER BY s.code
     """
-    with get_connection() as conn:
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    try:
         rows = conn.execute(query, (product_id,)).fetchall()
-    return [dict(r) for r in rows]
+        return [dict(r) for r in rows]
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
 
 
 def upsert_product_requirement(
@@ -2468,7 +2538,7 @@ def delete_product_requirement(product_id: int, slot_id: int) -> None:
         conn.commit()
 
 
-def list_group_members(group_id: int) -> list[dict]:
+def list_group_members(group_id: int, conn: sqlite3.Connection | None = None) -> list[dict]:
     query = """
         SELECT m.product_id, p.sku, p.name, m.priority
         FROM ProductComponentGroupMembers m
@@ -2476,17 +2546,92 @@ def list_group_members(group_id: int) -> list[dict]:
         WHERE m.group_id = ?
         ORDER BY m.priority, p.sku
     """
-    with get_connection() as conn:
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    try:
         rows = conn.execute(query, (group_id,)).fetchall()
-    return [dict(r) for r in rows]
+        return [dict(r) for r in rows]
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
 
 
-def list_product_coverage_slot_ids(product_id: int) -> Set[int]:
-    with get_connection() as conn:
+def list_product_coverage_slot_ids(product_id: int, conn: sqlite3.Connection | None = None) -> Set[int]:
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    try:
         rows = conn.execute(
             "SELECT slot_id FROM ProductSlotCoverage WHERE product_id=?", (product_id,)
         ).fetchall()
-    return {int(r["slot_id"]) for r in rows}
+        return {int(r["slot_id"]) for r in rows}
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
+
+
+def list_products_covering_slots(
+    slot_ids: Iterable[int], conn: sqlite3.Connection | None = None
+) -> list[dict]:
+    """Return products that cover any of the provided slots (used for unrestricted slots)."""
+    slot_ids = list({int(sid) for sid in slot_ids})
+    if not slot_ids:
+        return []
+    placeholders = ",".join("?" for _ in slot_ids)
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT c.product_id, p.sku, p.name, c.slot_id
+            FROM ProductSlotCoverage c
+            JOIN Products p ON p.id = c.product_id
+            WHERE c.slot_id IN ({placeholders})
+            """,
+            tuple(slot_ids),
+        ).fetchall()
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
+    products: Dict[int, dict] = {}
+    for row in rows:
+        pid = int(row["product_id"])
+        entry = products.setdefault(
+            pid,
+            {"product_id": pid, "sku": row["sku"], "name": row["name"], "coverage": set()},
+        )
+        entry["coverage"].add(int(row["slot_id"]))
+    return list(products.values())
+
+
+def get_product_group_memberships(
+    product_ids: Iterable[int], conn: sqlite3.Connection | None = None
+) -> Dict[int, Dict[int, int]]:
+    """Return mapping product_id -> {group_id: priority}."""
+    ids = list({int(pid) for pid in product_ids})
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    try:
+        rows = conn.execute(
+            f"SELECT product_id, group_id, priority FROM ProductComponentGroupMembers WHERE product_id IN ({placeholders})",
+            tuple(ids),
+        ).fetchall()
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
+    result: Dict[int, Dict[int, int]] = {}
+    for row in rows:
+        pid = int(row["product_id"])
+        gid = int(row["group_id"])
+        prio = int(row.get("priority") or 0)
+        result.setdefault(pid, {})[gid] = prio
+    return result
 
 
 # Warehouses and channels
@@ -2852,15 +2997,23 @@ def stock_on_hand(warehouse_id: int) -> Dict[int, float]:
     return {int(row["product_id"]): float(row["quantity"]) for row in rows}
 
 
-def get_stock_quantity(product_id: int, warehouse_id: int) -> float:
+def get_stock_quantity(
+    product_id: int, warehouse_id: int, conn: sqlite3.Connection | None = None
+) -> float:
     """Convenience wrapper to fetch current balance for a product in a warehouse."""
 
-    with get_connection() as conn:
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    try:
         row = conn.execute(
             "SELECT quantity FROM StockBalances WHERE product_id=? AND warehouse_id=?",
             (product_id, warehouse_id),
         ).fetchone()
-    return float(row[0]) if row else 0.0
+        return float(row[0]) if row else 0.0
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
 
 
 def get_stock_balance(product_id: int, warehouse_id: int) -> Tuple[float, float]:
@@ -3522,6 +3675,190 @@ def list_sale_lines(sale_id: int) -> List[sqlite3.Row]:
         )
 
 
+def get_sale_assembly_plan_by_line(
+    line_id: int, conn: sqlite3.Connection | None = None
+) -> Optional[dict]:
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    try:
+        plan_row = conn.execute(
+            "SELECT id, sale_id, sale_line_id, parent_product_id, warehouse_id, parent_qty, created_at "
+            "FROM SaleAssemblyPlans WHERE sale_line_id=?",
+            (line_id,),
+        ).fetchone()
+        if not plan_row:
+            return None
+        lines = conn.execute(
+            "SELECT id, plan_id, component_product_id, qty, cost_per_unit, amount, details_json "
+            "FROM SaleAssemblyPlanLines WHERE plan_id=? ORDER BY id",
+            (plan_row["id"],),
+        ).fetchall()
+        return {
+            "id": plan_row["id"],
+            "sale_id": plan_row["sale_id"],
+            "sale_line_id": plan_row["sale_line_id"],
+            "parent_product_id": plan_row["parent_product_id"],
+            "warehouse_id": plan_row["warehouse_id"],
+            "parent_qty": float(plan_row["parent_qty"] or 0.0),
+            "created_at": plan_row["created_at"],
+            "lines": [
+                {
+                    "id": ln["id"],
+                    "plan_id": ln["plan_id"],
+                    "component_product_id": ln["component_product_id"],
+                    "qty": float(ln["qty"] or 0.0),
+                    "cost_per_unit": float(ln["cost_per_unit"] or 0.0),
+                    "amount": float(ln["amount"] or 0.0),
+                    "details_json": ln["details_json"],
+                }
+                for ln in lines
+            ],
+        }
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
+
+
+def list_sale_assembly_plans(
+    sale_id: int, conn: sqlite3.Connection | None = None
+) -> list[dict]:
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    try:
+        plan_rows = conn.execute(
+            "SELECT id, sale_id, sale_line_id, parent_product_id, warehouse_id, parent_qty, created_at "
+            "FROM SaleAssemblyPlans WHERE sale_id=? ORDER BY id",
+            (sale_id,),
+        ).fetchall()
+        if not plan_rows:
+            return []
+        plan_ids = [int(r["id"]) for r in plan_rows]
+        placeholders = ",".join("?" for _ in plan_ids)
+        line_rows = conn.execute(
+            f"SELECT id, plan_id, component_product_id, qty, cost_per_unit, amount, details_json "
+            f"FROM SaleAssemblyPlanLines WHERE plan_id IN ({placeholders}) ORDER BY id",
+            tuple(plan_ids),
+        ).fetchall()
+        lines_by_plan: Dict[int, list[dict]] = {}
+        for ln in line_rows:
+            lines_by_plan.setdefault(int(ln["plan_id"]), []).append(
+                {
+                    "id": ln["id"],
+                    "plan_id": ln["plan_id"],
+                    "component_product_id": ln["component_product_id"],
+                    "qty": float(ln["qty"] or 0.0),
+                    "cost_per_unit": float(ln["cost_per_unit"] or 0.0),
+                    "amount": float(ln["amount"] or 0.0),
+                    "details_json": ln["details_json"],
+                }
+            )
+        return [
+            {
+                "id": pr["id"],
+                "sale_id": pr["sale_id"],
+                "sale_line_id": pr["sale_line_id"],
+                "parent_product_id": pr["parent_product_id"],
+                "warehouse_id": pr["warehouse_id"],
+                "parent_qty": float(pr["parent_qty"] or 0.0),
+                "created_at": pr["created_at"],
+                "lines": lines_by_plan.get(int(pr["id"]), []),
+            }
+            for pr in plan_rows
+        ]
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
+
+
+def delete_sale_assembly_plans_for_sale(
+    sale_id: int, conn: sqlite3.Connection | None = None
+) -> None:
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    try:
+        with safe_transaction(conn):
+            conn.execute("DELETE FROM SaleAssemblyPlans WHERE sale_id=?", (sale_id,))
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
+
+
+def create_sale_assembly_plan(
+    sale_id: int,
+    sale_line_id: int,
+    parent_product_id: int,
+    warehouse_id: int,
+    parent_qty: float,
+    components: list[dict],
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    try:
+        with safe_transaction(conn):
+            cur = conn.execute(
+                """
+                INSERT INTO SaleAssemblyPlans (sale_id, sale_line_id, parent_product_id, warehouse_id, parent_qty)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (sale_id, sale_line_id, parent_product_id, warehouse_id, parent_qty),
+            )
+            plan_id = int(cur.lastrowid)
+            for comp in components:
+                conn.execute(
+                    """
+                    INSERT INTO SaleAssemblyPlanLines (plan_id, component_product_id, qty, cost_per_unit, amount, details_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        plan_id,
+                        comp["component_product_id"],
+                        float(comp.get("qty", 0.0) or 0.0),
+                        float(comp.get("cost_per_unit", 0.0) or 0.0),
+                        float(comp.get("amount", 0.0) or 0.0),
+                        comp.get("details_json"),
+                    ),
+                )
+            return plan_id
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
+
+
+def sale_line_has_assembly(
+    line_id: int, conn: sqlite3.Connection | None = None
+) -> dict:
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    try:
+        plan_exists = conn.execute(
+            "SELECT 1 FROM SaleAssemblyPlans WHERE sale_line_id=?",
+            (line_id,),
+        ).fetchone()
+        prod_row = conn.execute("SELECT product_id FROM SalesLines WHERE id=?", (line_id,)).fetchone()
+        product_id = int(prod_row["product_id"]) if prod_row else None
+        requirements_exist = False
+        if product_id is not None:
+            req = conn.execute(
+                "SELECT 1 FROM ProductAssemblyRequirements WHERE product_id=? LIMIT 1",
+                (product_id,),
+            ).fetchone()
+            requirements_exist = bool(req)
+        return {
+            "plan_exists": bool(plan_exists),
+            "requirements_exist": requirements_exist,
+        }
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
+
+
 # Posting and stock movements
 
 def _apply_purchase_line(conn: sqlite3.Connection, move_date: str, purchase_id: int, line: sqlite3.Row) -> None:
@@ -3564,6 +3901,45 @@ def _apply_sale_line(conn: sqlite3.Connection, move_date: str, sale_id: int, lin
         "INSERT INTO StockMoves (move_date, product_id, warehouse_id, qty_in, qty_out, cost_per_unit, amount, reference_type, reference_id, channel, counterparty_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (move_date, product_id, warehouse_id, 0, qty, avg_cost, amount, "sale", sale_id, line["channel"], line["customer_id"]),
+    )
+
+
+def _apply_sale_component_line(
+    conn: sqlite3.Connection,
+    move_date: str,
+    sale_id: int,
+    warehouse_id: int,
+    component: dict,
+    channel: str,
+    customer_id: int | None,
+    allow_negative: bool,
+) -> None:
+    """Write-off a component item for an assembly sale plan."""
+    qty = float(component.get("qty", 0.0) or 0.0)
+    product_id = int(component["component_product_id"])
+    current_qty, avg_cost = _get_balance(conn, product_id, warehouse_id)
+    if qty > current_qty and not allow_negative:
+        raise ValueError(_stock_shortage_message(conn, product_id, warehouse_id))
+    new_qty = current_qty - qty
+    _set_balance(conn, product_id, warehouse_id, new_qty, avg_cost)
+    cost_per_unit = float(component.get("cost_per_unit", avg_cost))
+    amount = -qty * cost_per_unit
+    conn.execute(
+        "INSERT INTO StockMoves (move_date, product_id, warehouse_id, qty_in, qty_out, cost_per_unit, amount, reference_type, reference_id, channel, counterparty_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            move_date,
+            product_id,
+            warehouse_id,
+            0,
+            qty,
+            cost_per_unit,
+            amount,
+            "sale_component",
+            sale_id,
+            channel,
+            customer_id,
+        ),
     )
 
 
@@ -3693,13 +4069,79 @@ def _recalc_stock(conn: sqlite3.Connection, allow_negative: bool) -> None:
                 )
         elif etype == "sale":
             lines = conn.execute(
-                "SELECT sl.product_id, sl.quantity, sl.sale_price, sl.sale_price_base, ? as warehouse_id, ? as channel, ? as customer_id FROM SalesLines sl WHERE sl.sale_id=?",
+                "SELECT sl.id as sale_line_id, sl.product_id, sl.quantity, sl.sale_price, sl.sale_price_base, ? as warehouse_id, ? as channel, ? as customer_id FROM SalesLines sl WHERE sl.sale_id=?",
                 (doc["warehouse_id"], doc["channel"], doc["customer_id"], doc["id"]),
             ).fetchall()
             for ln in lines:
-                pair = (int(ln["product_id"]), int(ln["warehouse_id"]))
-                fifo_consume(pair, float(ln["quantity"]), allow_negative)
-                _apply_sale_line(conn, doc["doc_date"], doc["id"], ln, allow_negative)
+                warehouse_id = int(ln["warehouse_id"])
+                product_id = int(ln["product_id"])
+                sale_line_id = int(ln["sale_line_id"])
+
+                plan = get_sale_assembly_plan_by_line(sale_line_id, conn=conn)
+                if plan is None:
+                    requirements = list_product_requirements(product_id, conn=conn)
+                    if requirements:
+                        # Freeze component selection per sale line once and reuse it on subsequent recalculations.
+                        result = assembly_resolver.resolve_components_for_product(
+                            product_id,
+                            warehouse_id,
+                            float(ln["quantity"]),
+                            conn=conn,
+                            allow_negative=allow_negative,
+                        )
+                        missing_slots = result.get("missing_slots") or []
+                        if missing_slots:
+                            missing_label = ", ".join(
+                                f"{ms.get('slot_code') or ms.get('slot_name') or ms.get('missing_qty')}: {ms.get('missing_qty')}"
+                                for ms in missing_slots
+                            )
+                            raise ValueError(f"Не вистачає компонентів для продажу #{doc['id']}: {missing_label}")
+                        plan_components: list[dict] = []
+                        for comp in result.get("components") or []:
+                            comp_id = int(comp["product_id"])
+                            comp_qty = float(comp.get("qty", 0.0) or 0.0)
+                            _, avg_cost = _get_balance(conn, comp_id, warehouse_id)
+                            details = comp.get("covered_slots") or []
+                            plan_components.append(
+                                {
+                                    "component_product_id": comp_id,
+                                    "qty": comp_qty,
+                                    "cost_per_unit": avg_cost,
+                                    "amount": comp_qty * avg_cost,
+                                    "details_json": json.dumps({"covered_slots": details}, ensure_ascii=False)
+                                    if details
+                                    else None,
+                                }
+                            )
+                        create_sale_assembly_plan(
+                            doc["id"],
+                            sale_line_id,
+                            product_id,
+                            warehouse_id,
+                            float(ln["quantity"]),
+                            plan_components,
+                            conn=conn,
+                        )
+                        plan = get_sale_assembly_plan_by_line(sale_line_id, conn=conn)
+
+                if plan and plan.get("lines"):
+                    for comp in plan["lines"]:
+                        pair = (int(comp["component_product_id"]), warehouse_id)
+                        fifo_consume(pair, float(comp.get("qty") or 0.0), allow_negative)
+                        _apply_sale_component_line(
+                            conn,
+                            doc["doc_date"],
+                            doc["id"],
+                            warehouse_id,
+                            comp,
+                            doc["channel"],
+                            doc["customer_id"],
+                            allow_negative,
+                        )
+                else:
+                    pair = (product_id, warehouse_id)
+                    fifo_consume(pair, float(ln["quantity"]), allow_negative)
+                    _apply_sale_line(conn, doc["doc_date"], doc["id"], ln, allow_negative)
         elif etype == "inventory":
             lines = conn.execute(
                 "SELECT product_id, counted_qty, cost_override FROM InventoryLines WHERE inventory_id=?",
@@ -3937,6 +4379,7 @@ def unpost_sale(sale_id: int) -> None:
                 raise ValueError("Документ не проведено")
             conn.execute("UPDATE SalesDocuments SET status='draft' WHERE id=?", (sale_id,))
             _remove_cash_links(conn, "sale", sale_id)
+            delete_sale_assembly_plans_for_sale(sale_id, conn=conn)
             recalc_stock(conn=conn)
             lines_count = conn.execute("SELECT COUNT(*) FROM SalesLines WHERE sale_id=?", (sale_id,)).fetchone()[0]
             audit_event(
@@ -4389,6 +4832,7 @@ def profit_by_product(date_from: Optional[str] = None, date_to: Optional[str] = 
     date_to = _normalize_optional_date(date_to, field_label="Дата по")
     income_map = _sale_income_by_product(date_from, date_to)
     expense_map = _sale_expenses_by_product(date_from, date_to)
+    assembly_rows: list[sqlite3.Row] = []
     with get_connection() as conn:
         params: List[object] = []
         query = "SELECT product_id, SUM(amount) as cogs FROM StockMoves WHERE reference_type='sale'"
@@ -4416,7 +4860,26 @@ def profit_by_product(date_from: Optional[str] = None, date_to: Optional[str] = 
         extra_query += " GROUP BY ecca.product_id"
         extra_cogs_rows = conn.execute(extra_query, extra_params).fetchall()
         product_names = {row["id"]: row["name"] for row in conn.execute("SELECT id, name FROM Products")}
+        assembly_params: List[object] = []
+        assembly_query = (
+            "SELECT sap.parent_product_id as product_id, SUM(ABS(sapl.amount)) as cogs "
+            "FROM SaleAssemblyPlanLines sapl "
+            "JOIN SaleAssemblyPlans sap ON sap.id = sapl.plan_id "
+            "JOIN SalesDocuments s ON s.id = sap.sale_id "
+            "WHERE s.status='posted'"
+        )
+        if date_from:
+            assembly_query += " AND s.doc_date >= ?"
+            assembly_params.append(date_from)
+        if date_to:
+            assembly_query += " AND s.doc_date <= ?"
+            assembly_params.append(date_to)
+        assembly_query += " GROUP BY sap.parent_product_id"
+        assembly_rows = conn.execute(assembly_query, assembly_params).fetchall()
     cogs_map = {row["product_id"]: abs(float(row["cogs"])) for row in cogs_rows}
+    for row in assembly_rows:
+        pid = row["product_id"]
+        cogs_map[pid] = cogs_map.get(pid, 0.0) + float(row["cogs"] or 0.0)
     for row in extra_cogs_rows:
         pid = row["product_id"]
         cogs_map[pid] = cogs_map.get(pid, 0.0) + float(row["cogs"] or 0.0)
