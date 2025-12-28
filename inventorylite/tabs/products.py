@@ -108,6 +108,7 @@ class ProductsTab:
         ).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Рух", command=self.open_product_stock_moves).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Комплектація", command=self.open_product_assemblies).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Коди каналів", command=self.open_product_channel_codes).pack(side=tk.LEFT, padx=4)
 
     def set_category_filter_options(self, options: list[dict]) -> None:
         self.category_filter_options = list(options or [])
@@ -349,6 +350,190 @@ class ProductsTab:
             show_error("Комплектація", "Товар не знайдено.")
             return
         ProductAssemblyConfigDialog(self.frame, product)
+
+
+class ProductChannelCodesDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, product: dict) -> None:
+        super().__init__(parent)
+        self.title(f"Коди каналів: {product.get('sku')} — {product.get('name')}")
+        self.resizable(True, True)
+        self.transient(parent.winfo_toplevel())
+        self.grab_set()
+        self.product_id = int(product["id"])
+        self.channels = db.list_channels(active_only=False)
+        self.codes: list[dict] = []
+
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        columns = [
+            ("channel", "Канал", 160),
+            ("external_sku", "Зовнішній SKU", 150),
+            ("active", "Активний", 80),
+            ("primary", "Основний", 90),
+            ("last_seen", "Останній імпорт", 140),
+            ("note", "Нотатка", 200),
+        ]
+        self.table = TableFrame(main, columns, height=10)
+        self.table.pack(fill=tk.BOTH, expand=True)
+        self.table.on_double_click(self.edit_code)
+        self.table.register_context_menu(self.edit_code, self.delete_code)
+
+        btns = ttk.Frame(main)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="Додати", command=self.add_code).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Змінити", command=self.edit_code).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Видалити", command=self.delete_code).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Оновити", command=self.refresh_codes).pack(side=tk.RIGHT, padx=4)
+
+        self.refresh_codes()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.wait_window(self)
+
+    def refresh_codes(self) -> None:
+        try:
+            self.codes = list(db.list_channel_codes_for_product(self.product_id))
+        except Exception:
+            logging.exception("Failed to load channel codes")
+            show_error("Коди каналів", "Не вдалося завантажити коди каналів.")
+            return
+        self.table.set_rows(
+            [
+                {
+                    "id": row["id"],
+                    "channel": row["channel_name"],
+                    "external_sku": row["external_sku"],
+                    "active": "Так" if row["is_active"] else "Ні",
+                    "primary": "Так" if row["is_primary"] else "Ні",
+                    "last_seen": row["last_seen_at"] or "",
+                    "note": row["note"] or "",
+                }
+                for row in self.codes
+            ]
+        )
+
+    def _open_editor(self, existing: Optional[dict]) -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title("Код каналу")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Канал:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ch_names = [c["name"] for c in self.channels]
+        ch_ids = [int(c["id"]) for c in self.channels]
+        channel_var = tk.StringVar()
+        channel_combo = ttk.Combobox(dlg, textvariable=channel_var, state="readonly", values=ch_names, width=40)
+        channel_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(dlg, text="Зовнішній SKU:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        sku_var = tk.StringVar(value=existing.get("external_sku") if existing else "")
+        ttk.Entry(dlg, textvariable=sku_var, width=40).grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(dlg, text="Назва у файлі (опц.):").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        name_var = tk.StringVar(value=existing.get("external_name") if existing else "")
+        ttk.Entry(dlg, textvariable=name_var, width=40).grid(row=2, column=1, sticky="ew", padx=6, pady=4)
+
+        active_var = tk.BooleanVar(value=bool(existing.get("is_active")) if existing else True)
+        primary_var = tk.BooleanVar(value=bool(existing.get("is_primary")) if existing else True)
+        ttk.Checkbutton(dlg, text="Активний", variable=active_var).grid(row=3, column=1, sticky="w", padx=6)
+        ttk.Checkbutton(dlg, text="Основний", variable=primary_var).grid(row=4, column=1, sticky="w", padx=6)
+
+        ttk.Label(dlg, text="Нотатка:").grid(row=5, column=0, sticky="nw", padx=6, pady=4)
+        note_var = tk.StringVar(value=existing.get("note") if existing else "")
+        ttk.Entry(dlg, textvariable=note_var, width=40).grid(row=5, column=1, sticky="ew", padx=6, pady=4)
+
+        if existing:
+            try:
+                idx = ch_ids.index(int(existing["channel_id"]))
+                channel_combo.current(idx)
+            except ValueError:
+                channel_combo.set("")
+        elif ch_names:
+            channel_combo.current(0)
+
+        result: dict = {}
+
+        def on_save() -> None:
+            if not channel_var.get():
+                show_error("Коди каналів", "Оберіть канал.")
+                return
+            try:
+                ch_idx = ch_names.index(channel_var.get())
+                channel_id = ch_ids[ch_idx]
+            except ValueError:
+                show_error("Коди каналів", "Канал не знайдено.")
+                return
+            external_sku = sku_var.get().strip()
+            if not external_sku:
+                show_error("Коди каналів", "Зовнішній SKU обов'язковий.")
+                return
+            try:
+                db.upsert_channel_code(
+                    channel_id,
+                    self.product_id,
+                    external_sku,
+                    external_name=name_var.get().strip() or None,
+                    is_primary=1 if primary_var.get() else 0,
+                    is_active=1 if active_var.get() else 0,
+                    note=note_var.get().strip() or None,
+                )
+            except ValueError as exc:
+                show_error("Коди каналів", str(exc))
+                return
+            except Exception:
+                logging.exception("Failed to save channel code")
+                show_error("Коди каналів", "Не вдалося зберегти код.")
+                return
+            result["saved"] = True
+            dlg.destroy()
+
+        ttk.Button(dlg, text="Скасувати", command=dlg.destroy).grid(row=6, column=0, padx=6, pady=8, sticky="e")
+        ttk.Button(dlg, text="Зберегти", command=on_save).grid(row=6, column=1, padx=6, pady=8, sticky="w")
+        dlg.bind("<Return>", lambda _e: on_save())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.wait_window()
+        if result.get("saved"):
+            self.refresh_codes()
+
+    def add_code(self) -> None:
+        self._open_editor(None)
+
+    def edit_code(self) -> None:
+        selected = self.table.selected_id()
+        if not selected:
+            show_error("Коди каналів", "Оберіть рядок.")
+            return
+        existing = next((c for c in self.codes if str(c["id"]) == str(selected)), None)
+        if not existing:
+            show_error("Коди каналів", "Не знайдено запис.")
+            return
+        self._open_editor(existing)
+
+    def delete_code(self) -> None:
+        selected = self.table.selected_id()
+        if not selected:
+            show_error("Коди каналів", "Оберіть рядок.")
+            return
+        if not messagebox.askyesno("Коди каналів", "Видалити запис?"):
+            return
+        try:
+            db.delete_channel_code(int(selected))
+            self.refresh_codes()
+        except Exception:
+            logging.exception("Failed to delete channel code")
+            show_error("Коди каналів", "Не вдалося видалити код.")
+
+    def open_product_channel_codes(self) -> None:
+        product_id = self.product_table.selected_id()
+        if not product_id:
+            show_error("Коди каналів", "Оберіть товар.")
+            return
+        product = db.get_product(int(product_id))
+        if not product:
+            show_error("Коди каналів", "Товар не знайдено.")
+            return
+        ProductChannelCodesDialog(self.frame, product)
 
     def _process_product_import(self, rows: list[dict], options: dict) -> str:
         mode = options.get("mode", "create")

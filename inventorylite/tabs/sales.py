@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -389,6 +390,9 @@ class SalesTab:
 
         try:
             summary = self._process_sales_import(result["orders"], result["options"])
+        except ValueError as exc:
+            show_error("Імпорт продажів", str(exc))
+            return
         except Exception:
             logging.exception("Помилка під час імпорту продажів")
             show_error("Імпорт продажів", "Імпорт перервано помилкою. Деталі у логах.")
@@ -404,14 +408,24 @@ class SalesTab:
         channel_override = options.get("channel", "")
         mode = options.get("mode", "draft")
         allow_negative = bool(options.get("allow_negative"))
-        create_products = bool(options.get("create_products", True))
+        create_products = bool(options.get("create_products", False))
         create_customers = bool(options.get("create_customers"))
         use_file_channel = bool(options.get("use_file_channel"))
 
+        channels = db.list_channels(active_only=False)
+        channels_by_name = {c["name"].strip().lower(): c for c in channels}
+
+        def resolve_channel(raw: str) -> Optional[dict]:
+            if not raw:
+                return None
+            return channels_by_name.get(raw.strip().lower())
+
+        channel_override_row = resolve_channel(channel_override.strip()) if channel_override else None
+        if not use_file_channel and not channel_override_row:
+            raise ValueError("Оберіть канал або дозвольте визначати його з файлу.")
+
         product_rows = db.list_products()
         products_by_sku = {p["sku"].lower(): dict(p) for p in product_rows if p["sku"]}
-        products_by_name = {p["name"].lower(): dict(p) for p in product_rows if p["name"]}
-        products_by_supplier_sku = {p["supplier_sku"].lower(): dict(p) for p in product_rows if p.get("supplier_sku")}
         counterparties = db.list_counterparties()
         allowed_customer_types = {"customer", "both", "other"}
         customers_by_name = {
@@ -427,14 +441,43 @@ class SalesTab:
         created_products = 0
         created_customers = 0
         skipped_lines = 0
+        unresolved_lines = 0
         posted_docs = 0
         draft_docs = 0
         total_docs = 0
+        channel_code_cache: dict[tuple[int, str], Optional[int]] = {}
+        unmapped_items: dict[tuple[int, str], dict] = {}
+        unknown_channels: set[str] = set()
+        missing_channel = False
+        prepared_orders: list[dict] = []
+
+        def get_cached_channel_product(channel_id: int, external_sku: str) -> Optional[int]:
+            key = (channel_id, external_sku.strip().lower())
+            if key in channel_code_cache:
+                return channel_code_cache[key]
+            pid = db.get_product_id_by_channel_sku(channel_id, external_sku)
+            channel_code_cache[key] = pid
+            return pid
 
         grouped: dict[str, list[dict]] = defaultdict(list)
         for idx, row in enumerate(orders):
             key = row.get("order_no") or f"#{idx+1}"
-            grouped[key].append(row)
+            line_channel_raw = (row.get("channel") or "").strip()
+            line_channel_row = resolve_channel(line_channel_raw) if (use_file_channel and line_channel_raw) else None
+            if use_file_channel and line_channel_raw and not line_channel_row:
+                unknown_channels.add(line_channel_raw)
+            if not line_channel_row and channel_override_row:
+                line_channel_row = channel_override_row
+            if not line_channel_row:
+                missing_channel = True
+            new_row = dict(row)
+            new_row["_channel_row"] = line_channel_row
+            grouped[key].append(new_row)
+
+        if unknown_channels:
+            raise ValueError("Не знайдено канали:\n" + "\n".join(sorted(unknown_channels)))
+        if missing_channel:
+            raise ValueError("Не вказано канал для деяких рядків. Додайте колонку каналу у файлі або оберіть канал у формі.")
 
         for order_no, lines in grouped.items():
             doc_date = lines[0].get("doc_date") or datetime.now().strftime("%Y-%m-%d")
@@ -465,10 +508,10 @@ class SalesTab:
                     customers_by_name[customer_name.lower()] = new_cp
                     created_customers += 1
 
-            sale_lines: list[tuple[int, float, float, float]] = []
             comment = lines[0].get("comment", "").strip()
-            line_channel = lines[0].get("channel", "").strip()
-            channel_value = line_channel if (use_file_channel and line_channel) else channel_override
+            channel_row = lines[0].get("_channel_row")
+            channel_value = channel_row["name"] if channel_row else ""
+            prepared_lines: list[dict] = []
 
             for row in lines:
                 sku = (row.get("sku") or "").strip()
@@ -479,50 +522,124 @@ class SalesTab:
                 amount = float(row.get("amount") or 0)
                 if not price and qty and amount:
                     price = amount / qty
-
-                product_row = products_by_supplier_sku.get(supplier_sku.lower()) if supplier_sku else None
-                if not product_row:
-                    product_row = products_by_sku.get(sku.lower()) if sku else None
-                if not product_row and name:
-                    product_row = products_by_name.get(name.lower())
-                if not product_row and create_products:
-                    final_sku = sku or self.generate_unique_sku(name, set(products_by_sku.keys()))
-                    product_id = db.add_product(
-                        final_sku,
-                        name,
-                        brand_id,
-                        category_id,
-                        unit=default_unit,
-                        supplier_sku=supplier_sku,
-                    )
-                    product_row = {
-                        "id": product_id,
-                        "sku": final_sku,
-                        "name": name,
-                        "supplier_sku": supplier_sku,
-                    }
-                    products_by_sku[final_sku.lower()] = product_row
-                    if supplier_sku:
-                        products_by_supplier_sku[supplier_sku.lower()] = product_row
-                    products_by_name[name.lower()] = product_row
-                    created_products += 1
-
-                if not product_row or qty <= 0:
+                if not sku or not channel_row:
                     skipped_lines += 1
                     continue
+                product_id: Optional[int] = None
+                product_row: Optional[dict] = None
 
-                sale_lines.append((int(product_row["id"]), qty, price, 0.0))
+                cached = get_cached_channel_product(int(channel_row["id"]), sku)
+                if cached:
+                    product_id = cached
+                    db.touch_channel_code_seen(int(channel_row["id"]), sku, name or None)
+                else:
+                    product_row = products_by_sku.get(sku.lower()) if sku else None
+                    if product_row:
+                        product_id = int(product_row["id"])
+                        try:
+                            db.upsert_channel_code(int(channel_row["id"]), int(product_id), sku, name)
+                            db.touch_channel_code_seen(int(channel_row["id"]), sku, name)
+                            channel_code_cache[(int(channel_row["id"]), sku.strip().lower())] = int(product_id)
+                        except ValueError:
+                            pass
+                    elif create_products:
+                        final_sku = sku or self.generate_unique_sku(name, set(products_by_sku.keys()))
+                        product_id = db.add_product(
+                            final_sku,
+                            name,
+                            brand_id,
+                            category_id,
+                            unit=default_unit,
+                            supplier_sku=supplier_sku,
+                        )
+                        product_row = {
+                            "id": product_id,
+                            "sku": final_sku,
+                            "name": name,
+                            "supplier_sku": supplier_sku,
+                        }
+                        products_by_sku[final_sku.lower()] = product_row
+                        created_products += 1
+                        try:
+                            db.upsert_channel_code(int(channel_row["id"]), int(product_id), sku, name)
+                        except Exception:
+                            logging.exception("Failed to auto-bind new product to channel")
+
+                if not product_id:
+                    key = (int(channel_row["id"]), sku.strip())
+                    if key not in unmapped_items:
+                        unmapped_items[key] = {
+                            "channel_id": int(channel_row["id"]),
+                            "channel_name": channel_row["name"],
+                            "external_sku": sku.strip(),
+                            "external_name": name,
+                        }
+                prepared_lines.append(
+                    {
+                        "product_id": int(product_id) if product_id else None,
+                        "sku": sku.strip(),
+                        "name": name,
+                        "qty": qty,
+                        "price": price,
+                        "channel_id": int(channel_row["id"]),
+                    }
+                )
+
+            prepared_orders.append(
+                {
+                    "doc_date": doc_date,
+                    "customer_id": customer_id,
+                    "comment": comment,
+                    "channel": channel_value,
+                    "channel_id": int(channel_row["id"]) if channel_row else None,
+                    "lines": prepared_lines,
+                    "order_no": order_no,
+                }
+            )
+
+        mapping_result: dict[tuple[int, str], int] = {}
+        if unmapped_items:
+            dlg = UnmappedSkusDialog(
+                self.frame.winfo_toplevel(),
+                list(unmapped_items.values()),
+                default_brand_id=brand_id,
+                default_category_id=category_id,
+                default_unit=default_unit,
+            )
+            mapping_result = dlg.result.get("mappings", {}) if dlg.result else {}
+            created_products += dlg.result.get("created_products", 0) if dlg.result else 0
+
+        for order in prepared_orders:
+            sale_lines: list[tuple[int, float, float, float]] = []
+            for line in order["lines"]:
+                product_id = line["product_id"]
+                if not product_id:
+                    key = (int(line["channel_id"]), line["sku"])
+                    mapped = mapping_result.get(key)
+                    if mapped:
+                        product_id = mapped
+                        channel_code_cache[(int(line["channel_id"]), line["sku"].lower())] = mapped
+                        db.touch_channel_code_seen(int(line["channel_id"]), line["sku"], line["name"])
+                if not product_id:
+                    unresolved_lines += 1
+                    continue
+                if line["qty"] <= 0:
+                    skipped_lines += 1
+                    continue
+                sale_lines.append((int(product_id), float(line["qty"]), float(line["price"]), 0.0))
 
             if not sale_lines:
-                skipped_lines += len(lines)
+                skipped_lines += len(order["lines"])
                 continue
 
             total_docs += 1
             try:
-                sale_id = db.create_sale(doc_date, customer_id, warehouse_id, channel_value, comment, "UAH", 1.0)
+                sale_id = db.create_sale(
+                    order["doc_date"], order["customer_id"], warehouse_id, order["channel"], order["comment"], "UAH", 1.0
+                )
                 db.replace_sale_lines(sale_id, sale_lines, 1.0, 0.0)
             except Exception as exc:
-                logging.warning("Не вдалося створити продаж %s: %s", order_no, exc)
+                logging.warning("Не вдалося створити продаж %s: %s", order.get("order_no"), exc)
                 skipped_lines += len(sale_lines)
                 continue
 
@@ -559,9 +676,10 @@ class SalesTab:
         if created_customers:
             created_parts.append(f"створено клієнтів: {created_customers}")
         created_msg = ", ".join(created_parts) if created_parts else "без нових довідників"
+        unresolved_msg = f"; нерозпізнані SKU: {unresolved_lines}" if unresolved_lines else ""
         return (
             f"Опрацьовано документів: {total_docs}. Проведено: {posted_docs}, чернеток: {draft_docs}. "
-            f"{lines_msg}; {created_msg}."
+            f"{lines_msg}; {created_msg}{unresolved_msg}."
         )
 
 
@@ -613,6 +731,9 @@ class SalesImportDialog(tk.Toplevel):
         warehouse = next((w for w in self.warehouses if w["name"] == self.wh_var.get()), None)
         if not warehouse:
             show_error("Імпорт", "Оберіть склад")
+            return
+        if not self.use_file_channel_var.get() and not self.channel_var.get().strip():
+            show_error("Імпорт", "Оберіть канал або дозвольте брати його з файлу.")
             return
 
         normalized_orders = _normalize_sales_records(self.raw_rows, self.current_mapping)
@@ -672,7 +793,10 @@ class SalesImportDialog(tk.Toplevel):
         ttk.Label(parent, text="Канал (якщо не вказано у файлі):").grid(row=4, column=0, sticky="w", pady=4)
         self.channel_var = tk.StringVar()
         channel_values = [c["name"] for c in self.channels]
-        ttk.Combobox(parent, textvariable=self.channel_var, values=channel_values).grid(row=4, column=1, sticky="ew", pady=4)
+        channel_combo = ttk.Combobox(parent, textvariable=self.channel_var, values=channel_values, state="readonly")
+        channel_combo.grid(row=4, column=1, sticky="ew", pady=4)
+        if channel_values:
+            channel_combo.current(0)
 
         self.use_file_channel_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(parent, text="Брати канал із файлу, якщо він є", variable=self.use_file_channel_var).grid(
@@ -696,7 +820,7 @@ class SalesImportDialog(tk.Toplevel):
             variable=self.allow_negative_var,
         ).grid(row=7, column=1, sticky="w")
 
-        self.create_products_var = tk.BooleanVar(value=True)
+        self.create_products_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(parent, text="Створювати відсутні товари", variable=self.create_products_var).grid(
             row=8, column=1, sticky="w", pady=(4, 0)
         )
@@ -787,3 +911,169 @@ class SalesImportDialog(tk.Toplevel):
         self.settings.save()
         self.current_template_name.set(name)
         self.template_combo.configure(values=list(self.templates.keys()))
+
+
+class UnmappedSkusDialog(tk.Toplevel):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        items: list[dict],
+        *,
+        default_brand_id: int,
+        default_category_id: int,
+        default_unit: str,
+    ) -> None:
+        super().__init__(parent)
+        self.title("Нерозпізнані SKU")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+        self.result: dict = {"mappings": {}, "created_products": 0}
+        self.items = list(items or [])
+
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            main,
+            text="Не вдалося визначити товари за зовнішніми SKU. Прив'яжіть до існуючих або створіть нові товари.",
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        columns = [
+            ("channel", "Канал", 140),
+            ("sku", "Зовнішній SKU", 150),
+            ("name", "Назва", 220),
+            ("status", "Статус", 200),
+        ]
+        self.table = TableFrame(main, columns, height=8)
+        self.table.pack(fill=tk.BOTH, expand=True)
+
+        btns = ttk.Frame(main)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="Прив'язати до SKU", command=self._assign_existing).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Створити товар", command=self._create_product).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Закрити", command=self._on_close).pack(side=tk.RIGHT, padx=4)
+
+        self.default_brand_id = default_brand_id
+        self.default_category_id = default_category_id
+        self.default_unit = default_unit
+
+        self._refresh_table()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.wait_window(self)
+
+    def _refresh_table(self) -> None:
+        rows = []
+        for idx, item in enumerate(self.items, start=1):
+            key = (int(item["channel_id"]), item["external_sku"])
+            resolved = self.result["mappings"].get(key)
+            status = f"Прив'язано до ID {resolved}" if resolved else "Не прив'язано"
+            rows.append(
+                {
+                    "id": idx,
+                    "channel": item.get("channel_name", ""),
+                    "sku": item.get("external_sku", ""),
+                    "name": item.get("external_name", ""),
+                    "status": status,
+                }
+            )
+        self.table.set_rows(rows)
+
+    def _get_selected_item(self) -> Optional[dict]:
+        selected = self.table.selected_id()
+        if not selected:
+            show_error("Нерозпізнані SKU", "Оберіть рядок.")
+            return None
+        try:
+            idx = int(selected) - 1
+        except ValueError:
+            return None
+        if 0 <= idx < len(self.items):
+            return self.items[idx]
+        return None
+
+    def _assign_existing(self) -> None:
+        item = self._get_selected_item()
+        if not item:
+            return
+        values = simple_prompt(
+            "Прив'язати до товару",
+            ["Внутрішній SKU"],
+            [item.get("external_sku", "")],
+        )
+        if not values:
+            return
+        internal_sku = (values[0] or "").strip()
+        if not internal_sku:
+            show_error("Нерозпізнані SKU", "SKU не може бути порожнім.")
+            return
+        matches = db.find_products_by_internal_sku(internal_sku)
+        if not matches:
+            show_error("Нерозпізнані SKU", f"Товар зі SKU '{internal_sku}' не знайдено.")
+            return
+        if len(matches) > 1:
+            show_error("Нерозпізнані SKU", f"Знайдено кілька товарів зі SKU '{internal_sku}'. Уточніть SKU.")
+            return
+        product_id = int(matches[0]["id"])
+        try:
+            db.upsert_channel_code(
+                int(item["channel_id"]),
+                product_id,
+                item["external_sku"],
+                item.get("external_name"),
+            )
+        except ValueError as exc:
+            show_error("Нерозпізнані SKU", str(exc))
+            return
+        key = (int(item["channel_id"]), item["external_sku"])
+        self.result["mappings"][key] = product_id
+        self._refresh_table()
+
+    def _create_product(self) -> None:
+        item = self._get_selected_item()
+        if not item:
+            return
+        defaults = [item.get("external_sku", ""), item.get("external_name") or item.get("external_sku", "")]
+        values = simple_prompt("Створити товар", ["SKU", "Назва"], defaults)
+        if not values:
+            return
+        sku_val = (values[0] or "").strip()
+        name_val = (values[1] or "").strip() or sku_val
+        if not sku_val or not name_val:
+            show_error("Нерозпізнані SKU", "SKU і назва обов'язкові.")
+            return
+        try:
+            product_id = db.add_product(
+                sku_val,
+                name_val,
+                self.default_brand_id,
+                self.default_category_id,
+                self.default_unit,
+                True,
+            )
+        except sqlite3.IntegrityError as exc:
+            show_error("Нерозпізнані SKU", f"Не вдалося створити товар: {exc}")
+            return
+        except Exception:
+            logging.exception("Failed to create product from unmapped SKU")
+            show_error("Нерозпізнані SKU", "Не вдалося створити товар.")
+            return
+        self.result["created_products"] = self.result.get("created_products", 0) + 1
+        try:
+            db.upsert_channel_code(
+                int(item["channel_id"]),
+                int(product_id),
+                item["external_sku"],
+                item.get("external_name"),
+            )
+        except ValueError as exc:
+            show_error("Нерозпізнані SKU", str(exc))
+            return
+        key = (int(item["channel_id"]), item["external_sku"])
+        self.result["mappings"][key] = int(product_id)
+        self._refresh_table()
+
+    def _on_close(self) -> None:
+        self.destroy()
