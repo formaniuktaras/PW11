@@ -207,13 +207,12 @@ def document_prompt(
     line_frame.grid_columnconfigure(0, weight=1)
     content.rowconfigure(row_idx, weight=1)
 
-    columns = ["product", "quantity", "price", "expense", "amount"]
+    columns = ["product", "quantity", "price", "amount"]
     tree = ttk.Treeview(line_frame, columns=columns, show="headings", height=8)
     headings = {
         "product": ("Товар", 200),
         "quantity": ("Кількість", 90),
         "price": ("Ціна", 90),
-        "expense": ("Витрата/од.", 110),
         "amount": ("Сума", 90),
     }
     for col, (title, width) in headings.items():
@@ -228,8 +227,6 @@ def document_prompt(
     def refresh_currency_ui() -> None:
         price_label.config(text=f"Ціна ({curr_var.get()})")
         tree.heading("price", text=f"Ціна ({curr_var.get()})")
-        expense_label.config(text=f"Витрата/од. ({curr_var.get()})")
-        tree.heading("expense", text=f"Витрата/од. ({curr_var.get()})")
         tree.heading("amount", text=f"Сума ({curr_var.get()})")
 
     def on_currency_change(event=None):
@@ -283,29 +280,16 @@ def document_prompt(
     price_entry = ttk.Entry(entry_frame, textvariable=price_var, width=10)
     price_entry.grid(row=0, column=5, padx=4, pady=2, sticky="w")
 
-    expense_label = ttk.Label(entry_frame, text="Витрата/од.")
-    expense_label.grid(row=0, column=6, padx=4, pady=2, sticky="e")
-    expense_var = tk.StringVar(value="0")
-    expense_entry = ttk.Entry(entry_frame, textvariable=expense_var, width=10)
-    expense_entry.grid(row=0, column=7, padx=4, pady=2, sticky="w")
-
     line_data = []
     if lines:
         for ln in lines:
             price_field = "purchase_price" if doc_type == "purchase" else "sale_price"
-            expense_value = 0.0
-            if doc_type == "sale" and "unit_expense_doc" in ln.keys():
-                try:
-                    expense_value = float(ln["unit_expense_doc"])
-                except Exception:
-                    expense_value = 0.0
             line_data.append(
                 {
                     "product_id": ln["product_id"],
                     "product_name": ln["product_name"],
                     "quantity": float(ln["quantity"]),
                     "price": float(ln[price_field]),
-                    "expense": expense_value,
                     "amount": float(ln["quantity"]) * float(ln[price_field]),
                 }
             )
@@ -373,15 +357,14 @@ def document_prompt(
                     ln["product_name"],
                     f"{ln['quantity']:.2f}",
                     f"{ln['price']:.2f}",
-                    f"{ln.get('expense', 0.0):.2f}",
                     f"{ln['amount']:.2f}",
                 ),
             )
 
     editor = {"w": None, "row": None, "col": None}
 
-    editable_keys = {"quantity", "price", "expense"}
-    col_to_key = {"#1": "product", "#2": "quantity", "#3": "price", "#4": "expense", "#5": "amount"}
+    editable_keys = {"quantity", "price"}
+    col_to_key = {"#1": "product", "#2": "quantity", "#3": "price", "#4": "amount"}
 
     def _close_editor(save: bool):
         w = editor["w"]
@@ -402,7 +385,7 @@ def document_prompt(
                     if key == "quantity" and val <= 0:
                         messagebox.showerror("Валідація", "Кількість повинна бути > 0")
                         return
-                    if key in ("price", "expense") and val < 0:
+                    if key == "price" and val < 0:
                         messagebox.showerror("Валідація", "Значення не може бути від'ємним")
                         return
 
@@ -522,10 +505,6 @@ def document_prompt(
                 price0 = _parse_float(price_var.get(), default=0.0)
             except ValueError:
                 price0 = 0.0
-        try:
-            exp0 = _parse_float(expense_var.get(), default=0.0)
-        except ValueError:
-            exp0 = 0.0
         product_name = f"{product_row['name']} ({product_row['sku']})"
         line_data.append(
             {
@@ -533,7 +512,6 @@ def document_prompt(
                 "product_name": product_name,
                 "quantity": qty_delta,
                 "price": price0,
-                "expense": exp0,
                 "amount": qty_delta * price0,
             }
         )
@@ -808,13 +786,9 @@ def document_prompt(
                     existing["quantity"] += qty_val
                     if update_price_var.get():
                         existing["price"] = price_val
-                    existing["amount"] = existing["quantity"] * existing["price"]
+                existing["amount"] = existing["quantity"] * existing["price"]
                     updated_count += 1
                 else:
-                    try:
-                        exp0 = _parse_float(expense_var.get(), default=0.0)
-                    except ValueError:
-                        exp0 = 0.0
                     product_name = f"{product['name']} ({product['sku']})"
                     line_data.append(
                         {
@@ -822,7 +796,6 @@ def document_prompt(
                             "product_name": product_name,
                             "quantity": qty_val,
                             "price": price_val,
-                            "expense": exp0,
                             "amount": qty_val * price_val,
                         }
                     )
@@ -955,15 +928,11 @@ def document_prompt(
         try:
             qty = _parse_float(qty_var.get())
             price = _parse_float(price_var.get())
-            expense_value = _parse_float(expense_var.get(), default=0.0)
         except ValueError:
             messagebox.showerror("Валідація", "Невірні числові значення")
             return
         if qty <= 0:
             messagebox.showerror("Валідація", "Кількість повинна бути більшою за 0")
-            return
-        if expense_value < 0:
-            messagebox.showerror("Валідація", "Витрати не можуть бути від'ємними")
             return
         product_name = product_var.get().strip()
         product_id = product_lookup.get(product_name)
@@ -982,7 +951,6 @@ def document_prompt(
             "product_name": product_name,
             "quantity": qty,
             "price": price,
-            "expense": expense_value,
             "amount": qty * price,
         }
         line_data.append(data)
@@ -1002,7 +970,6 @@ def document_prompt(
     if editable:
         qty_entry.bind("<Return>", lambda ev: (add_line(), "break"))
         price_entry.bind("<Return>", lambda ev: (add_line(), "break"))
-        expense_entry.bind("<Return>", lambda ev: (add_line(), "break"))
 
     def add_new_product(default_name: str = ""):
         if not editable:
@@ -1159,7 +1126,7 @@ def document_prompt(
         return result_new
 
     btn_line = ttk.Frame(entry_frame)
-    btn_line.grid(row=0, column=8, padx=6)
+    btn_line.grid(row=0, column=6, padx=6)
     ttk.Button(btn_line, text="Новий товар", command=lambda: add_new_product(product_var.get()), state="normal" if editable else "disabled").pack(side=tk.LEFT, padx=4)
     ttk.Button(btn_line, text="Додати", command=add_line, style="Success.TButton", state="normal" if editable else "disabled").pack(side=tk.LEFT)
     ttk.Button(btn_line, text="Видалити", command=delete_line, style="Danger.TButton", state="normal" if editable else "disabled").pack(side=tk.LEFT, padx=4)
@@ -1224,12 +1191,7 @@ def document_prompt(
             "rate": rate,
             "order_expense_doc": order_expense if doc_type == "sale" else 0.0,
         }
-        if doc_type == "sale":
-            lines_to_save = [
-                (ln["product_id"], ln["quantity"], ln["price"], ln.get("expense", 0.0)) for ln in line_data
-            ]
-        else:
-            lines_to_save = [(ln["product_id"], ln["quantity"], ln["price"]) for ln in line_data]
+        lines_to_save = [(ln["product_id"], ln["quantity"], ln["price"]) for ln in line_data]
         result = (info, lines_to_save)
         dlg.destroy()
 
