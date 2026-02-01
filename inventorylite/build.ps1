@@ -24,6 +24,12 @@ if (-Not (Test-Path $venvPath)) {
 python -m pip install --upgrade pip
 python -m pip install -r inventorylite/requirements.txt
 
+python -m compileall inventorylite
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Python compileall failed"
+    exit 1
+}
+
 $iconBase64 = Get-Content -Raw "inventorylite/icons/app_ico_base64.txt"
 [IO.File]::WriteAllBytes("inventorylite/icons/app.ico", [Convert]::FromBase64String($iconBase64))
 

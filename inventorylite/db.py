@@ -3852,7 +3852,7 @@ def update_sale(
 
 
 def replace_sale_lines(
-    sale_id: int, lines: Iterable[Tuple[int, float, float, float]], exchange_rate: float, order_expense_doc: float = 0.0
+    sale_id: int, lines: Iterable[tuple], exchange_rate: float, order_expense_doc: float = 0.0
 ) -> None:
     with get_connection() as conn:
         status = conn.execute("SELECT status FROM SalesDocuments WHERE id=?", (sale_id,)).fetchone()
@@ -3861,17 +3861,22 @@ def replace_sale_lines(
         conn.execute("DELETE FROM SalesLines WHERE sale_id=?", (sale_id,))
         order_expense_base = order_expense_doc * exchange_rate
         amounts: List[float] = []
-        lines_cache: List[Tuple[int, float, float, float, float, float]] = []
-        for product_id, qty, price, unit_expense_doc in lines:
+        lines_cache: List[Tuple[int, float, float, float, float]] = []
+        for entry in lines:
+            if len(entry) == 3:
+                product_id, qty, price = entry
+            elif len(entry) == 4:
+                product_id, qty, price, _unit_expense_doc = entry
+            else:
+                raise ValueError("Невірний формат рядка продажу")
             amount_doc = qty * price
             price_base = price * exchange_rate
             amount = qty * price_base
-            unit_expense_base = unit_expense_doc * exchange_rate
-            lines_cache.append((product_id, qty, price, amount_doc, price_base, unit_expense_base))
+            lines_cache.append((product_id, qty, price, amount_doc, price_base))
             amounts.append(amount)
 
         total_amount = sum(amounts)
-        for idx, (product_id, qty, price, amount_doc, price_base, unit_expense_base) in enumerate(lines_cache):
+        for idx, (product_id, qty, price, amount_doc, price_base) in enumerate(lines_cache):
             allocated_order_expense = (order_expense_base * amounts[idx] / total_amount) if total_amount else 0.0
             conn.execute(
                 "INSERT INTO SalesLines (sale_id, product_id, quantity, sale_price, amount_doc, sale_price_base, amount, unit_expense_doc, unit_expense_base, order_expense_allocated_base) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -3883,8 +3888,8 @@ def replace_sale_lines(
                     amount_doc,
                     price_base,
                     amount,
-                    unit_expense_base / exchange_rate if exchange_rate else 0,
-                    unit_expense_base,
+                    0.0,
+                    0.0,
                     allocated_order_expense,
                 ),
             )
@@ -5080,7 +5085,7 @@ def _sale_expenses_by_product(date_from: Optional[str], date_to: Optional[str]) 
         params.append(date_to)
     where = " WHERE " + " AND ".join(clauses)
     query = (
-        "SELECT sl.product_id, SUM(sl.quantity * sl.unit_expense_base + sl.order_expense_allocated_base) as expense "
+        "SELECT sl.product_id, SUM(sl.order_expense_allocated_base) as expense "
         "FROM SalesLines sl JOIN SalesDocuments s ON s.id = sl.sale_id" + where + " GROUP BY sl.product_id"
     )
     with get_connection() as conn:
@@ -5212,7 +5217,7 @@ def dashboard_trends(date_from: Optional[str] = None, date_to: Optional[str] = N
         ).fetchall()
         revenue_rows = conn.execute(
             "SELECT strftime('%Y-%m', s.doc_date) as period, IFNULL(SUM(sl.amount),0) as revenue, "
-            "IFNULL(SUM(sl.quantity * sl.unit_expense_base + sl.order_expense_allocated_base),0) as expenses "
+            "IFNULL(SUM(sl.order_expense_allocated_base),0) as expenses "
             "FROM SalesLines sl JOIN SalesDocuments s ON s.id = sl.sale_id "
             "WHERE s.status='posted'" + sale_clause + " GROUP BY strftime('%Y-%m', s.doc_date) ORDER BY period",
             sale_params,
@@ -5331,7 +5336,7 @@ def sales_analysis(
         cogs_map[""] = cogs_map.get("", 0.0) + float(extra_cogs_total or 0.0)
 
         channel_expenses = conn.execute(
-            "SELECT COALESCE(s.channel,'') as channel, IFNULL(SUM(sl.quantity * sl.unit_expense_base + sl.order_expense_allocated_base),0) as expenses "
+            "SELECT COALESCE(s.channel,'') as channel, IFNULL(SUM(sl.order_expense_allocated_base),0) as expenses "
             "FROM SalesLines sl JOIN SalesDocuments s ON s.id = sl.sale_id "
             "WHERE s.status='posted'" + sale_clause + " GROUP BY COALESCE(s.channel,'')",
             sale_params,
@@ -5365,7 +5370,7 @@ def sales_analysis(
             extra_params,
         ).fetchall()
         category_expenses_rows = conn.execute(
-            "SELECT p.category_id, IFNULL(SUM(sl.quantity * sl.unit_expense_base + sl.order_expense_allocated_base),0) as expenses "
+            "SELECT p.category_id, IFNULL(SUM(sl.order_expense_allocated_base),0) as expenses "
             "FROM SalesLines sl "
             "JOIN SalesDocuments s ON s.id = sl.sale_id "
             "JOIN Products p ON p.id = sl.product_id "
