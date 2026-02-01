@@ -20,6 +20,12 @@ call ".\.venv\Scripts\activate.bat"
 python -m pip install --upgrade pip
 python -m pip install -r inventorylite\requirements.txt
 
+python -m compileall inventorylite
+if errorlevel 1 (
+    echo Python compileall failed
+    exit /b 1
+)
+
 python - <<"PY"
 from pathlib import Path
 import base64

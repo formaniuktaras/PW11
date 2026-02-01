@@ -786,7 +786,7 @@ def document_prompt(
                     existing["quantity"] += qty_val
                     if update_price_var.get():
                         existing["price"] = price_val
-                existing["amount"] = existing["quantity"] * existing["price"]
+                    existing["amount"] = existing["quantity"] * existing["price"]
                     updated_count += 1
                 else:
                     product_name = f"{product['name']} ({product['sku']})"
